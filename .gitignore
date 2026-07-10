@@ -206,6 +206,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Generated synthetic example data
+examples/synthetic-dataset/
+
 # PyPI configuration file
 .pypirc
 
