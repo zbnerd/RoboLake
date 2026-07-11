@@ -54,7 +54,9 @@ robolake pull demo/pick-place@v1 --output /tmp/robolake-restored
 
 `push` scans, registers, transfers, verifies, and finalizes synchronously. Success means the command
 returns only after the resolved version is `READY`. It reports scan totals, the version reference,
-uploaded and skipped files, and final state.
+uploaded and skipped files, and final state. Progress is written to stderr; the final stdout line is
+stable as `READY <dataset>@v<number>` so the demo can capture the resolved reference without parsing
+decorative progress output.
 
 `status` reports state, logical file and byte totals, derived `is_empty`, verified and pending
 logical files and bytes, safe failure information, and the next recovery action. Duplicate logical
@@ -66,10 +68,31 @@ that does not yet exist and reports verified file and byte progress.
 Dataset references split on the final `@v<positive integer>`. Dataset names are Unicode NFC text,
 may contain `/` namespace separators, and reject control characters, `@`, leading or trailing `/`,
 empty segments, and `.` or `..` segments. Names are metadata only and never enter filesystem paths
-or object keys.
+or object keys. Names remain case-sensitive after NFC normalization.
 
 CLI configuration uses `ROBOLAKE_API_URL`. Public commands have useful `--help`; M1 does not add
 `ls`, delete, GC, repair, auth, or multipart commands.
+
+### M1 operational defaults
+
+These resource controls are implementation settings, not manifest semantics. The API enforces them
+authoritatively and the CLI mirrors applicable checks before mutation.
+
+| Control | M1 default |
+| --- | ---: |
+| Dataset name | 255 UTF-8 bytes |
+| Normalized relative path | 1,024 UTF-8 bytes |
+| Media type | 255 ASCII characters |
+| Manifest entries | 100,000 |
+| Canonical manifest/request body | 67,108,864 bytes (64 MiB) |
+| Hash and transfer chunk | 1,048,576 bytes (1 MiB) |
+| Presigned URL lifetime | 900 seconds |
+| Download-plan page | 100 entries, maximum 500 |
+| Failure code/detail | 64 ASCII characters / 512 UTF-8 bytes |
+| Concurrent file transfers per CLI | 1 |
+
+Tests may lower size and page settings to exercise boundaries without allocating large fixtures.
+Production settings may be reduced for provider constraints but do not exceed the M1 maxima.
 
 ## 4. Component boundaries
 
@@ -220,8 +243,10 @@ reject entry mutation or manifest-identity changes after sealing, illegal versio
 transitions, every semantic update to `READY`, and identity mutation of `AVAILABLE` Blobs. These are
 last-line controls in addition to domain checks.
 
-Registration inserts or resolves the Dataset, allocates a version under a Dataset row lock, writes
-the version, entries, Blob upserts, sealing timestamp, and idempotency response in one transaction.
+Dataset creation/find and its idempotency response commit in one transaction. Version registration
+then locks that existing Dataset row and writes the version, entries, Blob upserts, sealing
+timestamp, and registration idempotency response in a second transaction. A Dataset with no version
+is a valid registry resource; the oversized-file preflight still runs before either transaction.
 Each Blob upload/verification commits its own progress. Finalization locks the version and rechecks
 entry count, byte total, canonical manifest hash, and Blob availability in one transaction.
 
@@ -241,7 +266,6 @@ Blob:
 UploadSession:
   CREATED -> IN_PROGRESS -> COMPLETED
                          \--> FAILED
-  CREATED/IN_PROGRESS -> ABORTED
 ```
 
 An empty version follows `DRAFT -> VERIFYING -> READY`; verification checks empty entries, zero
@@ -251,8 +275,9 @@ The manifest and entries are immutable in every state. `FAILED` describes a reco
 workflow, not mutable content identity. Rerunning `push` for the same source can transition the same
 version through `FAILED -> UPLOADING -> VERIFYING -> READY` without modifying its manifest.
 
-Only deterministic integrity outcomes such as `CHECKSUM_MISMATCH` or `SIZE_MISMATCH` move the
-version to `FAILED`. Network, database, and temporary object-storage errors leave the version in its
+Only `CHECKSUM_MISMATCH` and `SIZE_MISMATCH` move an M1 Blob and active version to `FAILED`.
+Invalid manifests and unsupported sizes are rejected before version creation. Network, database,
+and temporary object-storage errors leave the version in its
 current progress state because the outcome may be ambiguous and, for a database outage, cannot be
 reliably recorded in that database. Stable `failure_code` values drive retry advice; separate
 `FAILED_RECOVERABLE` and `FAILED_FATAL` states are not introduced.
@@ -267,8 +292,9 @@ reliably recorded in that database. Stable `failure_code` values drive retry adv
 4. Create/find the Dataset and register/find the manifest version idempotently.
 5. Move a version with missing Blobs to `UPLOADING`.
 6. For each unique manifest Blob, skip `AVAILABLE` or create/find its UploadSession.
-7. Request a short-lived URL signed for the exact bucket, deterministic key, PUT method, content
-   length, and checksum headers.
+7. Request a 900-second URL signed for the exact bucket, deterministic key, PUT method, content
+   length, and `x-amz-checksum-sha256` header. The header value is the Base64 form of the manifest's
+   raw 32-byte digest.
 8. Stream the local file directly to MinIO while recounting and rehashing it.
 9. Submit the opaque provider receipt; the API reconciles the deterministic object key and streams
    `GetObject` to calculate full SHA-256 and size independently.
@@ -291,9 +317,11 @@ See the AWS integrity documentation for the current single-operation limit:
 ### Duplicate and interrupted push
 
 `(dataset_id, manifest_sha256)` identifies a version. A repeated unchanged push resolves the same
-version; changed content creates the next version. CLI idempotency keys are deterministic per
-operation and payload, while the API stores the canonical request fingerprint. Same key and same
-payload replay the original response; same key and different payload returns conflict.
+version; changed content creates the next version. CLI idempotency keys use
+`robolake-m1:<operation>:<sha256-of-length-prefixed-canonical-fields>`, while the API stores the
+canonical request fingerprint. Same key and same payload replay the original response; same key and
+different payload returns conflict. The scopes are `dataset-create`, `version-register`, and
+`upload-session-create`; completion and finalization are resource-idempotent.
 
 After interruption, the CLI rescans and must reproduce the registered manifest. For each
 non-available Blob, the API inspects the deterministic key. If a PUT succeeded before the client
@@ -354,8 +382,8 @@ finalization calls are naturally idempotent. The API derives object keys from va
 never accepts a client-supplied physical key.
 
 The API owns an internal S3 client for control and verification plus a presigning client configured
-with `ROBOLAKE_S3_PUBLIC_ENDPOINT_URL`. URL validity remains short and configurable. URLs and query
-strings never enter logs, errors, database fields, or CLI arguments.
+with `ROBOLAKE_S3_PUBLIC_ENDPOINT_URL`. PUT and GET capabilities expire after 900 seconds. URLs and
+query strings never enter logs, errors, database fields, or CLI arguments.
 
 ## 12. Error and security contract
 
@@ -439,9 +467,9 @@ or an in-memory object store.
 
 1. run `docker compose up -d --build --wait`;
 2. create temporary deterministic robot-like nested files plus duplicate content;
-3. push them under a reserved synthetic demo Dataset;
-4. show status and canonical manifest;
-5. pull `v1` into a fresh destination;
+3. push them under a reserved synthetic demo Dataset and capture the stable final reference;
+4. show status and canonical manifest for that reference;
+5. pull the resolved version into a fresh destination;
 6. compare recursive bytes and independently generated SHA-256 inventories;
 7. remove temporary local files while preserving Compose volumes.
 
