@@ -11,7 +11,9 @@ file-byte bottleneck or distributing permanent storage credentials to researcher
 
 ## Decision
 
-Use an API-controlled, presigned direct-transfer strategy:
+Use an API-controlled, presigned direct-transfer strategy. M1 first proves a bounded complete slice
+with one create-only `PutObject` per Blob and rejects files above 5,000,000,000 bytes before any
+persistent mutation. M2 implements the final v0.1 large-file strategy:
 
 - files below 64 MiB use a presigned single `PutObject`;
 - files at or above 64 MiB use S3 multipart upload with a 64 MiB default part;
@@ -22,14 +24,15 @@ Use an API-controlled, presigned direct-transfer strategy:
   `ListParts`;
 - CLI revalidates the sealed source manifest before resuming and retransmits only absent, mismatched,
   or uncertain parts;
-- completion and `NoSuchUpload` ambiguity are resolved through the deterministic final key followed
-  by full SHA-256 verification;
+- final publication uses a create-only precondition and completion/`NoSuchUpload` ambiguity is
+  resolved through the deterministic key and the shared verification contract;
 - URLs expire after 15 minutes, application sessions after 72 idle hours, and provider stale uploads
   after seven days.
 
-Part ETags are opaque receipts. Part SHA-256 headers are used when supported, but publication relies
-on a full server-side read matching the manifest SHA-256 and size. Explicit application cleanup plus
-provider stale-upload cleanup handles orphan windows.
+Part ETags are opaque receipts. Publication never treats ETag or caller metadata as full-file
+identity. It accepts exact provider system full-object checksum/size when the provider passes the
+contract suite and falls back to a streamed full GET when that checksum is absent. Explicit
+application cleanup plus provider stale-upload cleanup handles multipart orphan windows.
 
 AWS documents the 10,000-part and 5 MiB–5 GiB limits
 ([multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)), presigned
@@ -47,8 +50,8 @@ and the need to complete or abort multipart uploads
   idempotent completion logic.
 - A URL holder can replay its permitted operation before expiry; v0.1 relies on a trusted network,
   short lifetime, narrow signing, and log redaction.
-- Synchronous full-object verification adds time after upload but provides portable SHA-256 meaning
-  across S3-compatible implementations.
+- Providers without a retrievable system full-object SHA-256 pay one fallback read; each supported
+  provider must pass the same contract suite.
 
 ## Alternatives considered
 
@@ -62,10 +65,10 @@ and scaling behavior an API concern.
 Rejected because credential distribution, least-privilege policy, rotation, and revocation are larger
 and riskier than a narrow presigning control plane.
 
-### Presign one PUT for every file
+### Presign one PUT for every file as the final v0.1 strategy
 
 Rejected for large files because a failed multi-gigabyte PUT restarts from byte zero and has no
-portable multipart resume point.
+portable multipart resume point. ADR 0006 authorizes it only for the bounded M1 vertical slice.
 
 ### Add a queue and background upload workers
 
@@ -76,3 +79,4 @@ need justifies queue infrastructure.
 
 - [Architecture: retry and resume](../ARCHITECTURE_V0_1.md#11-retry-url-renewal-and-resume-semantics)
 - [Threat model: presigned capability policy](../THREAT_MODEL_V0_1.md#8-presigned-capability-policy)
+- [ADR 0006: M1 conditional single-PUT slice](0006-m1-conditional-single-put-slice.md)

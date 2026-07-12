@@ -27,6 +27,10 @@ or application resources.
 - Dataset files and manifests are untrusted input even inside the trusted deployment.
 - Object storage provides its documented S3 operation semantics, but ETag is not trusted as a
   full-file digest.
+- Provider system SHA-256/size is trusted only after exact signed-checksum upload semantics pass the
+  pinned compatibility suite; an absent system SHA-256 triggers a full-GET fallback.
+- M1 local filesystem guarantees are limited to contract-tested Linux/macOS behavior. Windows/SMB
+  semantics and power-loss durability are outside the boundary.
 
 This boundary makes an Internet-exposed deployment unsafe. Adding authentication later does not
 retroactively make v0.1 multi-tenant; that requires a new threat model and ADR.
@@ -85,22 +89,22 @@ API↔PostgreSQL, and API↔object storage with service credentials.
 
 | ID | Threat and impact | Required controls | Verification and residual risk |
 | --- | --- | --- | --- |
-| T01 | Manifest path uses `..`, absolute/drive/UNC form, NUL, separator tricks, or normalized collisions to read or write outside the root | Typed `RelativePath`; NFC and POSIX normalization; reject unsafe segments and case-fold collisions; validate again at API and download | Unit corpus plus property tests; path checks alone do not stop a compromised CLI |
-| T02 | Symlink, special-file, or time-of-check/time-of-use race causes scanner to read unintended/changing bytes | Never follow symlinks; accept regular files only; open safely; pre/post `fstat`; detect mutation; revalidate source manifest before upload | Race windows remain on hostile local filesystems; v0.1 fails the whole operation when detected |
-| T03 | Download writes through a symlink or overwrites an existing file | Preflight all paths; containment check; non-following parent/temp creation; temporary sibling plus atomic rename; no overwrite by default | Platform-specific filesystem behavior requires Linux/macOS contract tests |
-| T04 | Manifest or object is modified in transit or at rest | TLS outside local Compose; sealed manifest SHA-256; per-part checksum when supported; server full-object SHA-256 and size before `READY`; download repeats verification | SHA-256 collision is accepted as negligible; compromised API can subvert verification |
-| T05 | Multipart ETag is mistaken for the file digest, publishing corrupt data | Treat ETag as opaque receipt only; compare manifest only to independently streamed SHA-256 and size | Integration tests use altered/reordered/truncated objects |
+| T01 | Manifest path uses traversal, controls, invalid Unicode, separator tricks, or normalized/ancestor collisions | Typed UTF-8/NFC POSIX `RelativePath`; fixed segment/path limits; reject exact/NFC/case-folded duplicate and ancestor collisions; validate at scan/API/pull | Linux/macOS corpus plus property tests; Windows/SMB is unsupported |
+| T02 | Symlink, special-file, or time-of-check/time-of-use race causes scanner/uploader to read unintended or changing bytes | Accept regular files only; capture root/file identities; use dirfd-relative no-follow traversal and reopen; pre/post `fstat`; hash scan and created upload bytes | Linux/macOS race tests require fail-closed behavior; a compromised kernel/filesystem remains outside the model |
+| T03 | Download writes through a symlink or overwrites a concurrently created destination | Private sibling staging; non-following temp creation; Linux `RENAME_NOREPLACE`/macOS `RENAME_EXCL`; fail closed if unsupported | Atomic visibility is tested; power-loss durability is not claimed |
+| T04 | Manifest or object is modified in transit or at rest | TLS outside Compose; sealed manifest; signed provider SHA-256/length; HEAD system checksum/size with missing-checksum full-GET fallback; pull rehashes bytes | `READY` is not continuous scrubbing; compromised provider/API can subvert evidence |
+| T05 | ETag, caller metadata, or multipart composite checksum is mistaken for full-file identity | Treat them as opaque/diagnostic only; accept provider system full-object SHA-256 or independently streamed fallback | Pinned-provider tests cover missing/mismatched system checksums |
 | T06 | A presigned URL leaks through logs, shell history, proxy analytics, or error output and is replayed | Return only over protected API; 15-minute default; exact method/key/part and signed headers; redact query strings; never put URLs in command arguments; refresh on demand | URLs are bearer tokens and can be replayed until expiry; no per-user revocation exists in v0.1 |
 | T07 | CLI receives permanent or overly broad object-store credentials | Only API holds least-privilege service credentials; CLI uses presigned URLs; bucket policy limits API principal to the blob prefix and required methods | API compromise exposes its full allowed prefix; key rotation is an operator action |
-| T08 | Presigned PUT overwrites an existing verified content key | One active session per blob; never presign writes for `AVAILABLE`; deterministic key; verify every completed object; restrict delete; conflict on size mismatch | Object storage does not enforce RoboLake's DB state; API credential misuse remains possible |
+| T08 | Replayed/stale presigned PUT overwrites a content key | Sign `If-None-Match: *`, checksum, length, method, and key; reconcile 412/409; never issue writes for AVAILABLE; no normal object delete | Pinned MinIO proves stale URL cannot overwrite; API credential misuse remains possible |
 | T09 | Duplicate or concurrent requests create duplicate versions/sessions or regress state | Idempotency records bound to request hash; row locks; unique/partial indexes; transition triggers; terminal `READY` | PostgreSQL availability is required for mutations; no offline registry mode |
-| T10 | Crash after provider completion yields ambiguous database state | Deterministic object key; retry `HeadObject`; full verification before state repair; `NoSuchUpload` is not treated as proof of failure | Verification adds storage reads and latency |
+| T10 | Crash after provider completion yields ambiguous database state | Deterministic key; idempotent completion; HEAD system checksum/size or fallback GET before state repair | Missing checksum adds one storage read; poisoned key stops for operator action |
 | T11 | Crash after provider multipart creation leaves untracked billed parts | Persist session intent first; explicit abort; expired-session cleanup; seven-day storage stale-upload backstop | Orphans can consume storage until cleanup runs |
-| T12 | Caller exhausts API/DB/storage with huge manifests, too many URL requests, parts, retries, or unfinished uploads | Configurable body/entry/page limits; streaming/pagination; 10,000-part cap; bounded URL batches; retry cap/jitter; one active session per blob; cleanup metrics | Exact production limits await observed dataset measurements |
-| T13 | Malicious media type, name, or failure detail reaches SQL/logs/terminal as injection | Parameterized SQLAlchemy statements; Pydantic transport validation; structured logs; terminal-safe escaping; bounded fields | CLI rendering libraries and log sinks remain dependencies to audit |
+| T12 | Caller exhausts API/DB/storage with huge manifests, capability requests, retries, or unfinished uploads | Fixed protocol manifest/path limits; one GET capability per response; one active session per Blob; bounded operational TTL/transfer limits; M2 part caps/cleanup | API remains unauthenticated and can be abused inside the trusted network |
+| T13 | Malicious name/path/failure detail reaches SQL/logs/terminal as injection | Parameterized SQLAlchemy; strict transport/domain validation; structured logs; terminal-safe escaping; bounded fields; no canonical media input | CLI rendering libraries and log sinks remain dependencies to audit |
 | T14 | Secrets or proprietary details enter Git through examples/tests/config | Synthetic/public fixtures only; `.env.example`; secret scanning; review docs and fixtures; ignore runtime state and local env files | Cannot prevent a contributor from intentionally committing data; repository review remains required |
 | T15 | Aborted cleanup deletes a completed object or active upload | Cleanup locks expired DB rows, calls multipart abort only, never object delete, reconciles `NoSuchUpload`, and records terminal state | Provider/operator out-of-band deletion remains possible |
-| T16 | Download serves a blob for the wrong logical path/version | Download plan derives key only from sealed entry hash; URL is generated server-side; CLI verifies expected hash and size for each path | A compromised registry can lie; database backups and access controls are operational needs |
+| T16 | Download serves a blob for the wrong logical path/version or skips an entry after replay | Immutable manifest ordinal/path; Version-bound stateless cursor; exact ordinal lookup; URL derived server-side; CLI verifies every path/hash before tree publish | Unsigned cursor is not authorization; caller already reads all READY entries |
 | T17 | Unauthenticated API caller reads manifests, creates transfers, or obtains bearer URLs | Bind v0.1 to a trusted network; document exposure prohibition; minimize URL TTL and service permissions | **Accepted high residual risk.** Internet or shared untrusted deployment is unsupported |
 
 Path traversal includes both `../` sequences and absolute paths, as categorized by
@@ -115,20 +119,19 @@ tokens according to
 - Display the source root locally but never send or record it server-side.
 - Refuse symlinks and non-regular files during scan; do not silently skip them.
 - Read and hash in bounded chunks; never load a multi-gigabyte file into memory.
-- Store any local resume hints under the user's state directory with user-only permissions. The API
-  and provider remain authoritative; local state contains no presigned URL.
 - Redact URL query strings and response headers before diagnostics.
-- On download, validate the entire manifest path set before creating any final file.
+- On download, validate the whole path set before staging, prepare a temp target before requesting
+  one capability, and publish only the complete verified tree.
 
 ### API and application
 
-- Reject file-body content types and enforce request, manifest-entry, page, and URL-batch limits.
+- Reject file bodies and enforce fixed manifest/path limits plus one GET capability per response.
 - Use domain-specific errors; generic internal failures expose a correlation ID, not exception or
   credential detail.
 - Authorize object keys by deriving them from validated SHA-256; never accept a client-supplied key.
-- Sign only the exact HTTP method, bucket, key, upload ID, part number, and required checksum headers.
+- Sign only exact method/bucket/key plus create-only, length, checksum, and later multipart fields.
 - Persist state transitions transactionally and log old/new state plus identifiers.
-- Keep verification reads bounded and cancellable; retry without changing content identity.
+- Use provider system checksum/size with bounded fallback reads; retry without changing identity.
 
 ### PostgreSQL
 
@@ -151,25 +154,27 @@ tokens according to
 ## 8. Presigned capability policy
 
 - Default validity is 15 minutes; callers request renewal for missing work.
-- Generate URLs in bounded pages and as late as practical.
-- Upload URLs target a single hash-derived key and, for multipart, one upload ID and part number.
-- Download URLs are generated only for `READY` entries.
+- Upload URLs target one hash-derived key and sign `If-None-Match: *`, expected length/checksum; M2
+  part URLs additionally bind one upload ID and part number.
+- Download URLs are generated only for READY entries, exactly one per response and immediately
+  before use. A stateless Version-bound cursor is replayable but is not secret or authorization.
 - URLs are returned in JSON bodies over protected transport and never included in logs, metrics,
   exceptions, analytics, or shell command arguments.
-- Signed checksum/content-length headers must be repeated exactly by CLI.
+- Signed precondition/checksum/content-length headers must be repeated exactly by CLI.
 - If supported by the deployment, bucket policy limits signature age and source network. AWS notes
   that `s3:signatureAge` can reduce effective lifetime
   ([AWS presigned guardrails](https://docs.aws.amazon.com/prescriptive-guidance/latest/presigned-url-best-practices/additional-guardrails.html)).
 
 ## 9. Abuse and resource limits
 
-Defaults are configuration, not product semantics. Initial values must be documented and exercised:
+Manifest validity uses deployment-independent protocol constants; operational settings are bounded
+configuration. Document and test:
 
-- maximum manifest request bytes and entry count;
-- maximum normalized path/media-type/dataset-name lengths;
-- API page and URL-batch sizes;
+- 64 MiB/100,000-entry manifest limits, 255-byte segment, 1,024-byte path, and dataset-name bounds;
+- exactly one M1 GET capability per response;
 - 64 MiB default multipart part size, provider minimum/maximum, and 10,000-part cap;
-- 15-minute URL lifetime, capped retry count, and 72-hour idle session timeout;
+- 15-minute URL lifetime, one immediate 409 reconciliation attempt, and 72-hour M2 idle session
+  timeout;
 - bounded concurrent uploads and verification reads per CLI/API process;
 - seven-day provider stale multipart cleanup.
 
@@ -178,27 +183,28 @@ capacity pressure visible without recording sensitive payloads.
 
 ## 10. Security test plan
 
-- Table-driven path corpus for relative/absolute traversal, encoded separators, NUL, Unicode
-  normalization, case collisions, Windows drives/UNC paths, long names, and symlinked parents
+- Table-driven path corpus for traversal, separators, controls/surrogates, NFC/case/ancestor
+  collisions, Windows drive/UNC forms, fixed lengths, and symlinked parents
 - Source mutation tests during scan and upload; special files and symlink cycles
-- Download tests against pre-existing files, symlink swaps, corrupt content, partial writes, and
-  cross-device rename behavior
+- Download tests for one-capability TTL/replay, pre-existing/symlink destinations, corrupt content,
+  partial writes, and concurrent atomic no-replace publication
 - API fuzz/property tests for state commands, manifest bounds, idempotency-key payload conflicts,
   and illegal transitions
 - PostgreSQL integration tests for constraints, triggers, concurrent registration, and row locks
-- MinIO tests for expired/replayed URLs, wrong signed headers, part replacement, missing parts,
-  ambiguous completion, abort, and stale cleanup
+- MinIO tests for signed create-only PUT, 200/412/409 convergence, stale URL refusal, wrong checksum,
+  system checksum/fallback, one-at-a-time GET expiry, and M2 multipart lifecycle
 - Log-capture assertions that secrets, query signatures, absolute source paths, and dataset bytes are
   absent
-- End-to-end corruption test proving a version cannot become `READY`, followed by safe recovery
+- End-to-end poisoned-object test proving no overwrite/delete and operator-led external recovery
 
 ## 11. Incident and recovery expectations
 
-- A leaked presigned URL: revoke/rotate the signing credential if immediate invalidation is required,
-  inspect object/session state, abort the session, and reverify affected blobs. v0.1 has no user-level
-  revocation.
-- A checksum mismatch: mark blob/version failed, retain safe identifiers and expected/actual size,
-  never expose bytes, and require explicit replacement upload.
+- A leaked presigned URL: revoke/rotate the signing credential if immediate invalidation is required
+  and inspect object/session state. M1 waits for single-operation capability expiry; M2 may abort an
+  active multipart session. v0.1 has no user-level revocation.
+- A poisoned content key: mark Blob/Version failed with `STORED_OBJECT_MISMATCH`, derive
+  `CONTACT_OPERATOR`, never overwrite/delete, and resume the same Version only after operator-led
+  external inspection/removal. M1 exposes no repair endpoint.
 - Database loss: restore database backup before serving registry operations; do not infer datasets
   solely from object keys.
 - Object loss: affected blobs fail verification/download; versions remain immutable but unavailable
@@ -215,7 +221,7 @@ capacity pressure visible without recording sensitive payloads.
 - Traffic confidentiality depends on deployment TLS and network controls outside local Compose.
 - No malware scanning, file-format parsing, content policy, legal retention, object lock, disaster
   recovery automation, authentication, or multi-tenancy is provided.
-- Very large verification requests can be slow; a durable worker is not introduced without observed
-  evidence and a new ADR.
+- A missing provider system checksum can require one full storage read. A durable verifier/auditor is
+  not introduced without observed evidence and a new ADR.
 
 These risks are acceptable only for the stated trusted-environment v0.1 evaluation.

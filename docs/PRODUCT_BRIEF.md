@@ -29,11 +29,12 @@ trusted environment.
 A researcher can run a CLI workflow that:
 
 1. scans a local directory without following symbolic links;
-2. emits a deterministic manifest of logical relative paths, sizes, media types, and SHA-256
-   digests;
+2. emits a minimal deterministic manifest of logical relative paths, sizes, and SHA-256 digests;
 3. registers a dataset and a content-fixed version;
-4. transfers missing blobs directly to S3-compatible storage with resumable multipart upload;
-5. asks RoboLake to verify stored bytes before marking the version `READY`; and
+4. transfers missing blobs directly to S3-compatible storage, using M1 create-only single PUTs and
+   M2 multipart resume for larger files;
+5. applies one provider-attested SHA-256/size verification contract before marking a Blob
+   `AVAILABLE`; and
 6. downloads a `READY` version into a safe destination and reconstructs its manifest paths.
 
 The registry answers which immutable version owns each logical path and which content-addressed
@@ -44,9 +45,10 @@ blob stores its bytes. It does not interpret the bytes.
 - Typer CLI for scan, register, upload, status, verify/finalize, and download
 - FastAPI control plane and PostgreSQL registry
 - MinIO-backed local development through the S3 API
-- Presigned single-part and multipart transfer, retry, and resume
+- Create-only presigned single PUT and file-level resume in M1; multipart/within-file resume in M2
 - Blob reuse by `(sha256, size_bytes)`
-- Full-file SHA-256 verification after upload and download
+- Provider system SHA-256/size verification with full-GET fallback when no system checksum exists;
+  download always hashes materialized bytes
 - Explicit version and upload-session state transitions
 - Cleanup of abandoned multipart uploads
 
@@ -61,10 +63,12 @@ alone is not a reason to add technology.
 
 - Two scans of an unchanged directory produce byte-identical canonical manifests and the same
   manifest SHA-256 regardless of traversal order.
-- A killed upload resumes without retransmitting parts already confirmed by object storage.
+- A killed M1 upload resumes without retransmitting whole Blobs already confirmed by the verification
+  contract; M2 adds within-file multipart resume.
 - Retrying dataset creation, version registration, part acknowledgement, completion, or finalization
   produces the same result rather than duplicate resources.
-- `READY` is impossible until every entry resolves to a size- and SHA-256-verified blob.
+- `READY` is impossible until every entry references an immutable `AVAILABLE` Blob. It is not a
+  continuous storage-integrity guarantee.
 - A downloaded version has the same relative paths, file sizes, and SHA-256 values as its manifest.
 - Unsafe paths, symlinks, changed-during-scan files, and destination escapes fail closed with useful
   CLI messages.
@@ -80,16 +84,21 @@ alone is not a reason to add technology.
 - Separate user-visible paths from physical object keys.
 - Prefer idempotent commands and explicit recovery over hidden background behavior.
 - Make immutability a database- and domain-enforced invariant, not a UI convention.
+- Prefer correctness over convenience and use detect-report-stop when automatic repair cannot be
+  proven safe.
+- Keep canonical identity minimal; reproducible presentation/enrichment metadata stays outside it.
 
 ## Assumptions and risks
 
 - The API can reach PostgreSQL and object storage over a reliable local network; the CLI can reach
   the API and the object-storage endpoint embedded in presigned URLs.
-- Very long server-side SHA-256 verification may exceed an infrastructure HTTP timeout. v0.1 keeps
-  verification synchronous and retryable; a durable job mechanism is considered only after this is
-  observed.
-- Dataset file counts, aggregate sizes, and available bandwidth are not yet measured. Interfaces
-  must paginate and stream where practical, while limits remain configurable rather than invented.
+- Object storage is trusted to provide its documented system-checksum semantics. The exact pinned
+  MinIO image is a compatibility gate; an object with no retrievable system SHA-256 uses a streamed
+  full-GET fallback.
+- Manifest-validity limits are fixed protocol constants. Transfer TTLs/timeouts and provider limits
+  are operational settings bounded by protocol/provider maxima.
+- Local filesystem behavior is supported on Linux/macOS. Windows runtime, SMB edge cases, and
+  power-loss durability are not v0.1 claims.
 - Presigned URLs are bearer capabilities. Short lifetimes and log redaction reduce, but do not
   replace, the deployment boundary that authentication would provide.
 

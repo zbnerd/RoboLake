@@ -22,10 +22,10 @@ Files remain opaque. The design deliberately excludes downstream processing and 
 | **B. CLI uses permanent storage credentials** | Simple high-throughput data path; native SDK resume | Long-lived credentials must be distributed, stored, scoped, rotated, and revoked on research machines; CLI can address more keys than one transfer | Reject |
 | **C. API creates uploads and presigns part operations** | Bytes bypass API; URLs are limited to one method/key/part and expire; server retains lifecycle control; multipart resume fits large files | More control-plane endpoints; URL renewal, part reconciliation, and ambiguous completion require explicit handling | **Choose** |
 
-Approach C is the smallest credible design for multi-gigabyte MCAP, video, and sensor files. A file
-smaller than 64 MiB uses a presigned `PutObject`; a file at or above that threshold uses multipart.
-The default multipart part size is 64 MiB and increases when necessary to remain below 10,000 parts.
-S3 permits at most 10,000 parts, with 5 MiB–5 GiB parts except that the final part has no minimum
+Approach C is the smallest credible design for multi-gigabyte MCAP, video, and sensor files. M1 uses
+one create-only `PutObject` per Blob and rejects a file above 5,000,000,000 bytes before persistent
+mutation. M2 introduces multipart/within-file resume with a 64 MiB default part that grows to stay
+below 10,000 parts. S3 permits at most 10,000 parts, with 5 MiB–5 GiB parts except the final part
 ([AWS multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)).
 
 Presigned URLs are time-limited bearer capabilities, not identities. They permit direct transfer
@@ -40,7 +40,7 @@ flowchart LR
     CLI -->|JSON control requests| API[FastAPI application]
     CLI -->|presigned PUT / UploadPart / GET| S3[(S3-compatible storage)]
     API -->|metadata and transitions| PG[(PostgreSQL)]
-    API -->|create/list/complete/abort,\nGET for verification| S3
+    API -->|HEAD/checksum, fallback GET,\npresign and multipart control| S3
     Operator[Operator] --> API
     Operator --> PG
     Operator --> S3
@@ -78,65 +78,64 @@ Dependency rules:
 
 ### 4.1 Scan and registration
 
-1. CLI resolves the selected root and walks it without following symlinks.
-2. For each regular file it validates the relative path, records stable metadata, streams SHA-256,
+1. CLI opens the selected root without following symlinks and walks through directory descriptors;
+   child opens are dirfd-relative and no-follow.
+2. For each regular file it validates the relative path, records size, streams SHA-256,
    and checks that file identity/size/timestamps did not change during the read.
 3. CLI sorts entries, writes canonical manifest bytes, and computes the manifest SHA-256.
 4. CLI creates or finds the dataset, then registers the complete manifest with an idempotency key.
 5. API validates canonical rules, inserts the version, entries, and missing `Blob` rows in one
    transaction, seals the manifest, and reports which blobs are already `AVAILABLE`.
 
-### 4.2 Upload and resume
+### 4.2 M1 upload and resume
 
-1. Before upload or resume, CLI rescans the source and requires the registered manifest hash.
-2. For each missing blob, CLI asks API for an upload session. One active session per blob is allowed.
-3. For each requested multipart part, CLI computes its SHA-256 and sends part number, byte range,
-   size, and digest to API. API validates/persists that expectation and returns a bounded batch of
-   URLs with the checksum header included in the signature where the provider supports it. For a
-   single PUT, the registered full-file digest serves the same purpose.
-4. CLI uploads directly to object storage, never logs URLs, and acknowledges successful parts to API.
-5. On resume, API paginates `ListParts` and reconciles provider parts with persisted part number,
-   size, ETag, and SHA-256. A part is skipped only when these records agree; otherwise it is safely
-   re-uploaded under the same part number.
-6. API completes the provider upload from an ordered, consecutive part list and marks the session
-   `COMPLETED`. ETags are opaque transfer receipts, not full-file hashes.
+1. CLI rescans the source, derives the immutable manifest identity, and applies the per-file limit
+   before any persistent operation.
+2. For each unique missing Blob, CLI gets/reuses the one active session and requests a URL signed
+   for exact key, length, SHA-256, and `If-None-Match: *`.
+3. CLI streams directly to object storage and interprets status only: `200` created, `412` requires
+   race reconciliation, and `409` requires reconciliation then retry if no object is visible.
+4. API completion performs HEAD with checksum mode. Exact provider system SHA-256 and size satisfy
+   the verification contract; an absent system checksum triggers a streamed full-GET fallback.
+5. Matching content becomes `AVAILABLE`; a poisoned key is reported and never overwritten/deleted.
+6. An interrupted PUT resumes at Blob granularity. M2 extends the same contract with UploadPart and
+   `ListParts`; ETags remain opaque receipts.
 
 ### 4.3 Verification and publication
 
-1. Finalization locks the version row and verifies that every entry resolves to a completed or
-   already `AVAILABLE` blob.
+1. Finalization locks the version row and verifies every entry resolves to `AVAILABLE`.
 2. The version moves to `VERIFYING`.
-3. For every new blob, API streams `GetObject`, counts bytes, and computes full-file SHA-256. It does
-   not buffer the object or return it to the caller.
-4. Matching blobs become `AVAILABLE`; a mismatch becomes `FAILED` and the version becomes `FAILED`.
-5. When all blobs are available, the transaction moves the version to `READY` and records
+3. It recomputes canonical manifest identity, logical/unique immutable totals, contiguous ordinals,
+   and Blob availability without rereading an already `AVAILABLE` Blob.
+4. The transaction moves the version to `READY` and records
    `ready_at`. A retry returns the same `READY` representation.
 
-This second read is intentional. Multipart ETags are not whole-object MD5 digests, and multipart
-SHA-256 may be a composite checksum rather than the SHA-256 of all file bytes
-([AWS integrity documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)).
+`AVAILABLE` is a reusable verification attestation. `READY` means all referenced Blobs passed the
+contract before publication; it is not a continuous scrub or per-Version reread guarantee.
 
 ### 4.4 Download
 
-1. CLI fetches the sealed manifest and a bounded page of presigned GET URLs for a `READY` version.
-2. It revalidates every logical path against the selected destination.
-3. It streams each object into a newly created temporary sibling file, computing byte count and
-   SHA-256.
-4. Only a match is atomically renamed to the final path. Existing files, symlinks, and normalized
-   path collisions fail closed.
-5. Directories implied by file paths are recreated. Empty source directories are not represented in
-   v0.1 manifests and therefore are not reconstructed.
+1. CLI fetches the sealed manifest, revalidates the complete path set, and creates a private sibling
+   staging tree.
+2. API returns exactly one ordinal-bound entry and one GET capability per request. The same
+   Version-bound cursor replays the same entry with a fresh URL and consumes no server state.
+3. CLI prepares a safe temp file before requesting the URL, immediately streams/hash-checks it, and
+   advances only after materializing that entry inside staging.
+4. After the whole manifest is present, Linux `renameat2(RENAME_NOREPLACE)` or macOS
+   `renamex_np(RENAME_EXCL)` publishes the tree. Unsupported no-replace semantics fail closed.
+5. Parent directories are implied. Empty child directories and filesystem metadata are not
+   reconstructed. M1 promises atomic visibility, not power-loss durability or pull resume.
 
 ## 5. Domain model
 
 | Model | Responsibility and invariants |
 | --- | --- |
-| `Dataset` | Stable registry identity and unique human-readable name. Owns ordered version numbers. |
-| `DatasetVersion` | Sealed manifest identity, lifecycle state, totals, and failure reason. Entries never change after registration; `READY` never transitions. |
-| `DatasetEntry` | One normalized logical file path mapped to `(sha256, size_bytes)` and optional media type. Unique within a version. |
-| `Blob` | Content-addressed physical object. Hash is identity; size must agree everywhere. Only `AVAILABLE` blobs satisfy a version. |
-| `UploadSession` | One attempt to materialize a blob with single PUT or multipart. Stores provider upload ID, sizing, expiry, and terminal result. |
-| `UploadPart` | Expected byte range and its persisted transfer receipt. Part numbers are consecutive and bounded by provider limits. |
+| `Dataset` | Stable UUID and unique name. Serializes dataset-scoped manifest-registration numbers. |
+| `DatasetVersion` | UUID business resource plus dataset-scoped manifest identity, lifecycle, and immutable logical/unique totals. Entries never change; `READY` is terminal. |
+| `DatasetEntry` | Immutable canonical ordinal and normalized logical file path referencing one Blob. |
+| `Blob` | UUID relational resource with globally unique SHA-256 physical identity. Size must agree; `AVAILABLE` is a reusable verification attestation. |
+| `UploadSession` | One M1 single-PUT attempt to materialize a Blob. M2 extends it with provider multipart state. |
+| `UploadPart` | M2-only expected byte range and opaque receipt; M1 creates no fake one-part row. |
 | `IdempotencyRecord` | Scope, key, request fingerprint, and stable response/resource for a mutating API call. |
 
 Domain value objects include `Sha256Digest`, `RelativePath`, `ManifestHash`, `ObjectKey`,
@@ -164,44 +163,43 @@ columns with `CHECK` constraints so migrations can evolve them explicitly.
 - `manifest_sha256 char(64) not null` with lowercase-hex check
 - `state text not null check (state in ('DRAFT','UPLOADING','VERIFYING','READY','FAILED'))`
 - `file_count bigint not null check (file_count >= 0)`
-- `total_bytes bigint not null check (total_bytes >= 0)`
+- `logical_bytes bigint not null check (logical_bytes >= 0)`
+- `unique_blob_count bigint not null check (unique_blob_count >= 0)`
+- `unique_blob_bytes bigint not null check (unique_blob_bytes >= 0)`
 - `sealed_at`, `created_at`, `ready_at`, `failure_code`, `failure_detail`
 - `unique (dataset_id, version_number)`, `unique (dataset_id, manifest_sha256)`, and an index on
   `(dataset_id, created_at)`
 
 ### `blobs`
 
-- `sha256 char(64) primary key`
+- `id uuid primary key`
+- `sha256 char(64) not null unique`
 - `size_bytes bigint not null check (size_bytes >= 0)`
 - `object_key text not null unique`
 - `state text not null check (state in ('PENDING','UPLOADING','VERIFYING','AVAILABLE','FAILED'))`
 - `verified_at`, `created_at`, `failure_code`
-- `unique (sha256, size_bytes)` to support a composite reference and make size disagreement explicit
+- a duplicate SHA-256 with another size is an integrity conflict
 
 ### `dataset_entries`
 
 - `dataset_version_id uuid not null references dataset_versions(id)`
+- `manifest_ordinal bigint not null check (manifest_ordinal >= 0)`
 - `relative_path text not null` with non-empty and length checks
-- `size_bytes bigint not null check (size_bytes >= 0)`
-- `sha256 char(64) not null`
-- `media_type text null`
+- `blob_id uuid not null references blobs(id)`
 - primary key `(dataset_version_id, relative_path)`
-- composite foreign key `(sha256, size_bytes) references blobs(sha256, size_bytes)`
-- indexes on `sha256` and `(dataset_version_id, sha256)`
+- unique `(dataset_version_id, manifest_ordinal)`
+- indexes on `blob_id` and `(dataset_version_id, blob_id)`
 
 ### `upload_sessions`
 
 - `id uuid primary key`
-- `dataset_version_id uuid not null references dataset_versions(id)`
-- `blob_sha256 char(64) not null references blobs(sha256)`
-- `strategy text not null check (strategy in ('SINGLE_PUT','MULTIPART'))`
-- `state text not null check (state in ('CREATED','IN_PROGRESS','COMPLETED','ABORTED','FAILED'))`
-- `object_key text not null`, `provider_upload_id text null`
-- `part_size_bytes bigint null`, `expected_part_count integer not null`
-- `expires_at`, `last_activity_at`, `created_at`, `completed_at`, `failure_code`
-- partial unique index on `blob_sha256` while state is `CREATED` or `IN_PROGRESS`
+- `blob_id uuid not null references blobs(id)` and initiating-version UUID foreign key
+- `strategy text not null check (strategy = 'SINGLE_PUT')` in M1
+- `state text not null check (state in ('CREATED','IN_PROGRESS','COMPLETED','FAILED'))`
+- opaque `etag`, bounded failure fields, and activity/completion timestamps
+- partial unique index on `blob_id` while state is `CREATED` or `IN_PROGRESS`
 
-### `upload_parts`
+### `upload_parts` (M2)
 
 - `upload_session_id uuid not null references upload_sessions(id) on delete cascade`
 - `part_number integer not null check (part_number between 1 and 10000)`
@@ -243,8 +241,9 @@ blobs/sha256/ab/cd/abcdef...<64 hex total>
 
 Logical filenames, dataset names, version numbers, and source paths never enter an object key. A
 multipart upload targets its final content key but is invisible as an object until completion.
-RoboLake never issues a write URL for an `AVAILABLE` blob. Object metadata may repeat the digest and
-size for diagnostics, but PostgreSQL plus byte verification remains authoritative.
+Every M1 PUT is create-only and signs `If-None-Match: *`, exact Content-Length, and expected
+SHA-256. RoboLake never issues a write URL for an `AVAILABLE` Blob. Provider system checksum is
+verification evidence; caller metadata and ETag are diagnostic only.
 
 ## 8. Manifest schema and canonical hash
 
@@ -257,8 +256,7 @@ Version 1 has one JSON object:
     {
       "relative_path": "camera/front.mp4",
       "size_bytes": 123456,
-      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      "media_type": "video/mp4"
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }
   ]
 }
@@ -266,18 +264,21 @@ Version 1 has one JSON object:
 
 Canonicalization rules are part of the versioned contract:
 
-1. Normalize each path to Unicode NFC and `/` separators.
-2. Reject absolute, drive-qualified, UNC, empty, NUL-containing, `.`/`..`-segment, symlink, and
-   non-regular-file paths. Reject exact and Unicode/case-folded collisions.
-3. Sort entries by the UTF-8 bytes of `relative_path`.
-4. Use the field order shown above; omit `media_type` when unknown. Media types come from a fixed,
-   versioned extension map, not host configuration.
-5. Serialize UTF-8 without BOM, indentation, insignificant whitespace, ASCII escaping, or trailing
+1. Accept Unicode scalar text, normalize paths to NFC, and store `/` separators.
+2. Reject absolute/drive/UNC/backslash forms, controls, empty/dot segments, a segment over 255 UTF-8
+   bytes, a path over 1,024 UTF-8 bytes, symlinks, and non-regular files.
+3. Reject exact/NFC/case-folded duplicate and ancestor-prefix collisions.
+4. Sort entries by `relative_path` UTF-8 bytes and assign contiguous zero-based manifest ordinals.
+5. Use only the field order shown above. Media/format hints and filesystem metadata are not
+   canonical, accepted from clients, or persisted in M1.
+6. Serialize UTF-8 without BOM, indentation, insignificant whitespace, ASCII escaping, or trailing
    newline. Integers are base-10 JSON numbers.
-6. Hash exactly those bytes with SHA-256.
+7. Hash exactly those bytes with SHA-256.
 
 No hostname, absolute root, owner, permissions, timestamps, or traversal order enters the manifest.
-The API rejects a supplied hash that does not match re-canonicalized content.
+Parent directories are implicit and nested empty directories are ignored. The API rejects a
+supplied hash or ordering that does not match re-canonicalized content. Validity limits are fixed
+protocol constants shared by all deployments.
 
 ## 9. State machines
 
@@ -289,35 +290,34 @@ stateDiagram-v2
     DRAFT --> UPLOADING: missing blob session starts
     DRAFT --> VERIFYING: all blobs already available
     UPLOADING --> VERIFYING: all uploads complete
-    VERIFYING --> READY: every blob verified
-    VERIFYING --> FAILED: integrity mismatch
-    FAILED --> UPLOADING: explicit repair starts replacement upload
+    VERIFYING --> READY: every blob AVAILABLE
+    VERIFYING --> FAILED: stored object mismatch
+    FAILED --> UPLOADING: external cause resolved, retry starts
     READY --> [*]
 ```
 
-Transient upload or object-read failures do not fail the version. They leave it `UPLOADING` or
-`VERIFYING` for retry. `FAILED` means the registered content cannot currently be published. An
-explicit repair command may create a replacement upload for the same expected hash and return the
-version to `UPLOADING`; the sealed manifest and entries never change. `READY` is terminal.
+Transient or ambiguous upload/storage failures do not fail the version. `FAILED` means the same
+immutable registered content cannot currently be published. A poisoned key requires operator
+inspection/removal outside RoboLake; M1 has no repair/delete command. A later push can return the
+same Version to `UPLOADING` after that external condition is resolved. `READY` is terminal.
+Status also derives a blocking failure/action from referenced Blob state, so another non-READY
+Version sharing the same poisoned Blob reports `CONTACT_OPERATOR` without storing a duplicate
+action field.
 
 ### Upload session
 
 ```mermaid
 stateDiagram-v2
     [*] --> CREATED
-    CREATED --> IN_PROGRESS: URL issued or first part accepted
-    CREATED --> ABORTED: explicit/expired cleanup
-    CREATED --> FAILED: provider initiation fails permanently
+    CREATED --> IN_PROGRESS: URL issued
     IN_PROGRESS --> COMPLETED: provider completion confirmed
-    IN_PROGRESS --> ABORTED: explicit/expired cleanup
-    IN_PROGRESS --> FAILED: unrecoverable session error
+    IN_PROGRESS --> FAILED: stored object mismatch
     COMPLETED --> [*]
-    ABORTED --> [*]
     FAILED --> [*]
 ```
 
-A terminal failed or missing provider session is replaced by a new session for the same blob; the
-sealed dataset version is not changed.
+A failed M1 session is replaced for the same Blob only after its cause is safe to retry; the sealed
+DatasetVersion is never changed. ABORTED and multipart expiry semantics enter with M2.
 
 ### Blob
 
@@ -326,9 +326,9 @@ stateDiagram-v2
     [*] --> PENDING
     PENDING --> UPLOADING
     UPLOADING --> VERIFYING: object completed
-    VERIFYING --> AVAILABLE: size and SHA-256 match
-    VERIFYING --> FAILED: mismatch
-    FAILED --> UPLOADING: explicit replacement session
+    VERIFYING --> AVAILABLE: verification contract passes
+    VERIFYING --> FAILED: stored object mismatch
+    FAILED --> UPLOADING: external cause resolved, retry starts
     AVAILABLE --> [*]
 ```
 
@@ -337,66 +337,75 @@ stateDiagram-v2
 - Mutating create/register calls require `Idempotency-Key`. The server hashes the canonical request,
   inserts `(scope, key)` under a uniqueness constraint, and stores the stable response in the same
   transaction as the resource. Same key/same hash replays; same key/different hash conflicts.
-- Version numbers are allocated while locking the dataset row. The unique database constraint is
-  authoritative under concurrency.
+- DatasetVersion resource identity is UUID; `(dataset_id, manifest_sha256)` is snapshot identity;
+  `<dataset>@vN` is a human reference. Numbers are registration order, not READY order, and are
+  allocated while locking the Dataset row.
 - Upload-session creation locks the blob row and uses the partial unique index to return an existing
   active session rather than create a competitor.
-- Part expectation and acknowledgement are PUT operations keyed by `(session, part_number)`. The
-  request binds part number/range/size/checksum before signing; the same receipt is a no-op;
-  disagreement triggers provider reconciliation.
-- `CompleteMultipartUpload` is preceded by a fresh `ListParts`. If completion succeeds but its
-  response is lost, retry checks `HeadObject` at the deterministic key. `NoSuchUpload` plus a matching
-  object enters verification; it never accepts the object on ETag alone.
-- Finalization locks the version. `READY` returns immediately; `FAILED` returns its stable failure;
-  `VERIFYING` safely continues unresolved checks.
+- M1 URL issuance signs exact create-only preconditions. `200` means this client created; `412`
+  requires reconciliation; `409` reconciles once and remains retryable if no object is visible.
+  Conflict paths never overwrite/delete and concurrent pushes converge on one Blob/Version.
+- Completion is resource-idempotent and accepts no required ETag. HEAD system SHA-256/size or the
+  missing-checksum full-GET fallback is authoritative.
+- Finalization locks the Version. `READY` replays; `FAILED` can retry the same manifest only when its
+  external cause is resolved.
+- M2 part acknowledgement is keyed by `(session, part_number)` and ambiguous multipart completion
+  reconciles the same deterministic key before any final state.
 
 An unavoidable orphan window exists if the process crashes after provider multipart creation but
 before persisting its upload ID. Storage stale-upload cleanup is the compensating control.
 
 ## 11. Retry, URL renewal, and resume semantics
 
-- Presigned URLs default to 15 minutes and are generated only for requested missing parts. The CLI
-  requests bounded batches so a slow transfer does not receive thousands of soon-expiring URLs.
-- Upload sessions expire after 72 hours without acknowledged activity. Each valid acknowledgement
-  refreshes activity, not the already issued URL.
-- CLI retries connection failures, HTTP 408/429, and 5xx responses with capped exponential backoff
-  and full jitter. Other 4xx responses fail, except an expired signature requests a replacement URL.
-- Before every resume, CLI verifies the local source against the sealed manifest. API paginates
-  `ListParts` (the API can return at most 1,000 per call) and reconciles all pages.
-- Uploading the same multipart part number replaces that part, which makes a mismatched or uncertain
-  receipt safe to resend. Completion uses consecutive part numbers in ascending order.
-- `NoSuchUpload` during resume means either cleanup or ambiguous completion. API first checks the
-  deterministic final key; a matching size proceeds to full verification, otherwise it creates a
-  replacement session.
-- Single PUT ambiguity follows the same final-key check and full verification path.
+- M1 PUT URLs default to 15 minutes and are issued just before one sequential Blob transfer. A
+  dropped single PUT restarts that Blob from byte zero.
+- `412` is a create-only race signal, not success; API reconciliation must prove the existing object.
+  `409` with no visible match is `UPLOAD_CONFLICT`/`RETRY_PUSH` and does not persist FAILED state.
+- A lost PUT acknowledgement is reconciled by deterministic key under the same verification
+  contract. Missing key receives a fresh URL; poisoned key stops for operator action.
+- M1 GET capabilities are never batched. The API returns one ordinal at a time; the CLI requests the
+  next only after current materialization. Replaying a cursor refreshes URL TTL without consuming it.
+- A GET connection failure discards the staging tree and M1 pull restarts; Range/pull resume is a
+  later ADR.
+- M2 adds 72-hour multipart session expiry, paginated `ListParts`, part replacement, and
+  `NoSuchUpload` reconciliation without changing Blob/Version identity.
 
 ## 12. Checksum policy
 
 - SHA-256 of each full local file is the blob identity recorded in the manifest.
-- CLI computes per-part SHA-256 and includes a signed `x-amz-checksum-sha256` header when validated
-  against the configured provider. A provider-confirmed part checksum is defense in depth.
-- Multipart ETags and composite checksums are never compared with the manifest full-file digest.
-- API verification streams the completed object and independently calculates full SHA-256 and size.
+- M1 signs a precalculated full-object `x-amz-checksum-sha256`, exact Content-Length, and
+  `If-None-Match: *`. A compliant provider rejects mismatching bytes before object creation.
+- API requests provider system `ChecksumSHA256` with HEAD and matches size. If the system SHA-256 is
+  absent, API streams one full GET and calculates SHA-256/size; caller metadata and ETag never count.
+- Multipart ETags and composite checksums are never compared with a manifest full-file digest. M2
+  must retain equivalent full-object verification meaning.
 - Download repeats full SHA-256 and size verification before atomic placement.
 - Hash equality with a size mismatch is a hard integrity conflict, not deduplication.
 
 ## 13. Path traversal and filesystem defense
 
 Scanning rejects symlinks rather than resolving them, which avoids cycles and reading outside the
-selected root. The scanner uses non-following directory traversal and compares pre/post `fstat`
-metadata while hashing. A detected source mutation invalidates the entire manifest.
+selected root. On supported Linux/macOS runtimes the scanner and later uploader use dirfd-relative
+no-follow opens from a captured root identity, preventing a checked parent from being replaced by an
+outside symlink. Pre/post `fstat` metadata guards file mutation; a mismatch invalidates the
+operation.
 
 On download, validation is repeated even for a server-provided sealed manifest:
 
-- parse paths as logical POSIX paths and reject roots, drives, UNC prefixes, backslashes, NUL, empty
-  components, `.` and `..`;
-- normalize Unicode and reject normalized/case-fold collisions before any write;
+- accept Unicode scalar text, normalize NFC, and reject roots, drives, UNC/backslash forms,
+  controls, empty/dot components, segments over 255 UTF-8 bytes, and paths over 1,024 UTF-8 bytes;
+- reject exact/NFC/case-folded duplicate and ancestor-prefix collisions before any write;
 - resolve the destination root once and prove every candidate parent remains beneath it;
-- create parents and temporary files without following symlinks, then recheck before atomic rename;
-- refuse an existing final path by default and never write through a symlink.
+- create parents and temporary files without following symlinks;
+- publish the complete private staging tree with Linux/macOS atomic no-replace syscalls and fail
+  closed when unavailable. General replacing rename is not a fallback.
 
 These controls address both relative and absolute path traversal described by
 [CWE-22](https://cwe.mitre.org/data/definitions/22).
+
+M1 contract-tests Linux/macOS and does not claim Windows/SMB filename semantics. It guarantees
+atomic visibility under handled failures and normal process interruption, not persistence across
+power loss; complete directory-tree durability requires more than file-only `fsync`.
 
 ## 14. Abandoned multipart cleanup
 
@@ -417,19 +426,16 @@ failures. The seven-day storage backstop is longer than the 72-hour application 
 ## 15. Expected CLI workflow
 
 ```bash
-robolake dataset scan ./demo-dataset --output manifest.json
-robolake dataset create demo-dataset
-robolake version register demo-dataset --manifest manifest.json
-robolake version upload <version-id> --source ./demo-dataset
-robolake version status <version-id>
-robolake version finalize <version-id>
-robolake version download <version-id> --output ./restored-dataset
+robolake push ./examples/demo-dataset --dataset demo/pick-place
+robolake status demo/pick-place@v1
+robolake manifest demo/pick-place@v1
+robolake pull demo/pick-place@v1 --output /tmp/robolake-restored
 ```
 
-Each mutating CLI command creates and reuses an idempotency key for the attempted operation. Upload
-requires both the registered version ID and source root; no absolute source path is sent to API.
-Progress is written for humans on a TTY and as stable structured records with `--json`. Presigned
-URLs and credentials are always redacted.
+`push` composes scan/register/transfer/finalize and returns only when READY. It shows logical
+snapshot totals, unique content, and invocation-created/reused Blob outcomes. `status` exposes
+logical and unique views. `pull` reports logical materialization, not exact network bytes. No
+absolute source path is sent to API; capabilities/credentials are always redacted.
 
 ## 16. API endpoint proposal
 
@@ -437,24 +443,21 @@ All endpoints are under `/v1`; error bodies use stable machine codes plus safe h
 
 | Method and path | Purpose | Idempotency |
 | --- | --- | --- |
-| `POST /datasets` | Create a named dataset | Required key |
-| `GET /datasets` | List/filter datasets with pagination | Read-only |
-| `GET /datasets/{dataset_id}` | Read dataset metadata | Read-only |
-| `POST /datasets/{dataset_id}/versions` | Validate and seal a manifest | Required key |
-| `GET /versions/{version_id}` | State, totals, failure, upload progress | Read-only |
+| `POST /datasets` | Create/find a named dataset | Required key |
+| `POST /datasets/{dataset_id}/versions` | Validate/seal or find a manifest | Required key |
+| `GET /versions/resolve` | Resolve dataset name and registration number | Read-only |
+| `GET /versions/{version_id}` | State, dual-view totals/progress, failure/action | Read-only |
 | `GET /versions/{version_id}/manifest` | Return canonical sealed manifest | Read-only |
 | `POST /versions/{version_id}/upload-sessions` | Get/create a session for one blob | Required key |
-| `GET /upload-sessions/{session_id}` | Reconciled session and part state | Read-only |
-| `POST /upload-sessions/{session_id}/urls` | Presign selected missing parts or PUT | Naturally scoped; request key recommended |
-| `PUT /upload-sessions/{session_id}/parts/{part_number}` | Persist a part receipt | Resource-idempotent |
-| `POST /upload-sessions/{session_id}/complete` | Reconcile and complete object | Resource-idempotent |
-| `DELETE /upload-sessions/{session_id}` | Abort an incomplete session | Resource-idempotent |
-| `POST /versions/{version_id}/finalize` | Verify blobs and publish version | Resource-idempotent |
-| `POST /versions/{version_id}/download-plan` | Return a bounded page of presigned GETs | Short-lived read capability |
+| `GET /upload-sessions/{session_id}` | Reconciled M1 session state | Read-only |
+| `POST /upload-sessions/{session_id}/url` | Presign one exact create-only PUT | Resource-scoped |
+| `POST /upload-sessions/{session_id}/complete` | Idempotently verify/reconcile object; ETag optional | Resource-idempotent |
+| `POST /versions/{version_id}/finalize` | Recheck invariants and publish | Resource-idempotent |
+| `POST /versions/{version_id}/download-plan` | Return zero/one ordinal-bound entry and GET | Replayable read capability |
 
-The API rejects dataset file bodies and enforces conservative JSON/body-size and page-size limits.
-Large manifests may be accepted as a streamed request later within v0.1 only if observed file counts
-require it; the initial contract remains the same.
+The API rejects dataset file bodies, unknown canonical fields, invalid cursors, and any M1 request
+for more than one GET capability. Cursor payload is fixed-width, Version-bound, unsigned, and not an
+authorization token. M2 adds multipart endpoints without changing the M1 resource identities.
 
 ## 17. Local Docker Compose environment
 
@@ -476,8 +479,8 @@ credentials. No Kafka, worker, frontend, or orchestration service is present.
 
 ### Unit tests
 
-- Manifest canonicalization golden vectors and shuffled traversal order
-- Value-object validation, state-transition tables, idempotency fingerprints, and part sizing
+- Minimal manifest golden vectors, ancestor/case-fold collision corpus, and shuffled traversal order
+- Value-object validation, state transitions, idempotency fingerprints, metrics, and cursor codec
 - Source mutation/symlink/special-file rejection and download path containment
 - Retry classification, URL redaction, and stable CLI exit/error mapping
 - Domain/application import-boundary tests
@@ -485,27 +488,27 @@ credentials. No Kafka, worker, frontend, or orchestration service is present.
 ### PostgreSQL integration tests
 
 - Real Alembic upgrade/downgrade from an empty database
-- Constraints and immutability triggers, concurrent version allocation, duplicate idempotency keys,
-  row locking, and terminal-state behavior
+- Constraints, immutable ordinals/summaries, concurrent version allocation, duplicate idempotency
+  keys, row locking, derived progress, and terminal-state behavior
 - Transaction rollback around manifest registration and finalization
 
 ### MinIO integration tests
 
-- Presigned PUT, multipart create/upload/list/complete/abort, expired URL renewal, and pagination
-- Process interruption after selected parts and resume without confirmed-part retransmission
-- Lost completion response, `NoSuchUpload`, wrong ETag, wrong checksum, truncated object, and cleanup
-- Full SHA-256 verification and content-addressed reuse across versions
+- M1 create-only PUT signed headers, 200/412/409 convergence, stale URL refusal, and checksum reject
+- System-checksum verification, missing-checksum full-GET fallback, lost acknowledgement, and
+  poisoned-object stop without overwrite/delete
+- One-at-a-time GET expiry/replay behavior against the pinned image
+- M2 adds multipart create/upload/list/complete/abort and selected-part resume contracts
 
 ### API/CLI and end-to-end tests
 
 - FastAPI tests use the real application service with fake ports for exhaustive error mapping and
   Compose services for contract tests.
 - CLI tests use Typer's runner for help, exit codes, JSON output, and progress redaction.
-- Release test executes scan → register → interrupted upload → resume → finalize → download → tree
-  comparison using synthetic data, including one file larger than 5 GiB.
+- M1 release test executes push → interruption/resume → status/manifest → pull → tree comparison with
+  synthetic data under the single-PUT limit. M2 release evidence adds a file above 5 GB.
 
-Tests may lower the multipart threshold to exercise part behavior with small fixtures; the release
-test validates production defaults. Integration tests are explicitly marked and never silently
+Tests may lower operational limits/TTLs to exercise boundaries. Integration tests are explicitly marked and never silently
 fall back to SQLite or an in-memory object-store substitute.
 
 ## 19. Operational signals
@@ -518,12 +521,14 @@ readiness.
 
 ## 20. Known limitations and review triggers
 
-- Synchronous verification may need replacement if measured infrastructure timeouts prevent reliable
-  multi-gigabyte checks. That change requires an issue and ADR; no queue is preselected.
 - Empty directories and filesystem metadata such as mode, ownership, timestamps, hard links, and
   extended attributes are not preserved.
-- Case-fold collision rejection favors portable reconstruction over preserving case-distinct files
-  from case-sensitive source filesystems.
+- Case-fold/ancestor rejection favors reconstruction across supported Linux/macOS filesystems over
+  preserving case-distinct source names. Windows/SMB semantics are unsupported.
+- Pull is sequential, issues one capability at a time, has no Range resume, and guarantees atomic
+  visibility rather than power-loss durability.
+- `AVAILABLE` and `READY` are attestations, not continuous object scrubbing. Pull detects later
+  corruption; M1 has no automatic repair or persistent CORRUPTED state.
 - Authentication, authorization, tenant isolation, and untrusted-network deployment are unsupported.
 - Provider compatibility is proven against local MinIO first. Any additional S3-compatible product
   needs the same contract suite before support is claimed.

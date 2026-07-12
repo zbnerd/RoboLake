@@ -15,7 +15,7 @@ def test_postgresql_is_reachable_at_migration_head() -> None:
             assert connection.execute(text("SELECT 1")).scalar_one() == 1
             assert (
                 connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-                == "20260710_0001"
+                == "20260711_0002"
             )
     finally:
         engine.dispose()

@@ -23,13 +23,17 @@ RoboLake v0.1 must solve only this problem:
 
 - Solve one observed problem at a time.
 - Build vertical slices, not speculative infrastructure.
+- Prefer correctness over convenience.
+- Make immutable resources and create-only storage operations the default.
+- Detect, report, and stop when safe automatic recovery cannot be proven.
 - CLI usability is a first-class requirement.
-- Dataset versions are immutable once READY.
+- Dataset-version manifests are immutable from registration; READY is terminal.
 - Upload and completion operations must be idempotent.
 - Raw files belong in object storage.
 - Searchable metadata belongs in PostgreSQL.
 - Logical paths and physical object keys must be separated.
 - Store blobs by content hash when practical.
+- Treat canonical manifests and SHA-256 byte identities as sources of truth.
 - Every important state transition must be explicit and testable.
 
 ## Explicit non-goals for v0.1
@@ -93,12 +97,13 @@ At minimum, model:
 - DatasetEntry
 - Blob
 - UploadSession
-- UploadPart
+- UploadPart, beginning with multipart support in M2
 
 Suggested state transitions:
 
 - DatasetVersion: DRAFT -> UPLOADING -> VERIFYING -> READY | FAILED
-- UploadSession: CREATED -> IN_PROGRESS -> COMPLETED | ABORTED | FAILED
+- M1 UploadSession: CREATED -> IN_PROGRESS -> COMPLETED | FAILED
+- UploadSession ABORTED and UploadPart lifecycle begin with M2 multipart support
 
 READY versions are immutable.
 
@@ -109,7 +114,9 @@ A manifest entry should contain at least:
 - relative_path
 - size_bytes
 - sha256
-- media_type, when detectable
+
+Do not place suffix-derived media types or other reproducible enrichment in the canonical manifest.
+M1 snapshot identity is limited to schema version, normalized regular-file paths, sizes, and bytes.
 
 The manifest itself must have a deterministic hash independent of filesystem traversal order.
 
@@ -124,6 +131,9 @@ Never include absolute local filesystem paths in the stored manifest.
 - Provide .env.example only.
 - Reject path traversal and unsafe relative paths.
 - Validate downloaded content before placing it on disk.
+- Treat presigned URLs as bearer capabilities and never log their query strings.
+- M1 filesystem behavior is supported and contract-tested on Linux and macOS; Windows runtime and
+  Windows filename semantics are not supported yet.
 
 ## Engineering quality
 

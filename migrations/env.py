@@ -5,6 +5,7 @@ from __future__ import annotations
 from logging.config import fileConfig
 
 from alembic import context
+from robolake.infrastructure import models as _models  # noqa: F401
 from robolake.infrastructure.database import Base
 from robolake.infrastructure.settings import Settings
 from sqlalchemy import engine_from_config, pool
