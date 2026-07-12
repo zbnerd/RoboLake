@@ -9,15 +9,17 @@ pytestmark = pytest.mark.unit
 runner = CliRunner()
 
 
-def test_root_help_lists_m0_commands_and_no_transfer_commands() -> None:
+def test_root_help_lists_m1_push_query_commands() -> None:
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0
     assert "Robot dataset transfer and registry platform" in result.output
     assert "example" in result.output
     assert "version" in result.output
-    assert "push" not in result.output
-    assert "pull" not in result.output
+    assert "push" in result.output
+    assert "status" in result.output
+    assert "manifest" in result.output
+    assert "pull" in result.output
 
 
 def test_version_reports_project_version() -> None:

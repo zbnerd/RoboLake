@@ -29,109 +29,105 @@ later milestones must not be pulled forward as speculative infrastructure.
   Typer, SQLAlchemy, and S3 SDK imports.
 - No dataset-transfer behavior or excluded technology is introduced.
 
-## M1 — Deterministic manifest slice
+## M1 — Complete create-only vertical slice
 
-**Goal:** Turn a local directory into a safe, reproducible content contract.
-
-**Scope**
-
-- Implement manifest domain types, canonical serialization, media-type policy, and SHA-256 hashing.
-- Add `robolake dataset scan SOURCE --output manifest.json`.
-- Reject symlinks, special files, path escapes, normalized-path collisions, and changed files.
-
-**Acceptance criteria**
-
-- Golden tests prove identical bytes and hash across shuffled traversal orders.
-- Unit tests cover empty files, Unicode NFC paths, nested trees, large streamed files, mutation during
-  scan, symlinks, Windows-style absolute/drive paths, `..`, NUL, and duplicate normalized paths.
-- A scan never records an absolute source path and memory use is independent of individual file size.
-- CLI output identifies counts, total bytes, manifest hash, and validation failures.
-
-## M2 — Registry and immutable versions
-
-**Goal:** Register manifests in PostgreSQL with explicit invariants.
+**Goal:** Push one regular-file tree as an immutable Version and pull byte-identical files safely.
 
 **Scope**
 
-- Add Dataset, DatasetVersion, DatasetEntry, Blob, idempotency-record tables, constraints, and Alembic
-  migration.
-- Implement create/read dataset, register/read version, manifest, and status API operations.
-- Add CLI register and status commands.
+- Canonical file-only manifest, streamed SHA-256, Linux/macOS path contract, and pre-persistence
+  5,000,000,000-byte per-file rejection.
+- Dataset/Version/Entry/Blob/UploadSession/idempotency persistence and database invariants.
+- Create-only presigned single PUT, provider-attested verification with missing-checksum full-GET
+  fallback, whole-file resume, Blob deduplication, status, manifest, and finalization.
+- One-capability-at-a-time pull into a private staging tree with atomic no-replace publication.
 
 **Acceptance criteria**
 
-- Concurrent registrations assign unique monotonic version numbers per dataset.
-- Repeated requests with the same key and payload return the same resource; a changed payload returns
-  `409 Conflict`.
-- Database constraints reject duplicate dataset names, version numbers, relative paths, invalid
-  hashes, negative sizes, and invalid lifecycle states.
-- Tests prove an entry set cannot be altered after registration and a `READY` version cannot regress.
-- Integration tests run against PostgreSQL, not SQLite.
+- Required `push`, `status`, `manifest`, and `pull` commands complete the synthetic workflow.
+- Same manifest resolves the same Version; changed manifests get registration-order numbers even
+  while older Versions are non-READY.
+- `200`, `412`, and `409` conditional-write paths converge without overwrite/delete; a stale URL
+  cannot mutate an `AVAILABLE` Blob.
+- Status separates logical snapshot and unique-content progress without persisted counters; each
+  push result separately reports invocation-created/reused Blob outcomes.
+- Poisoned objects stop with `CONTACT_OPERATOR`; M1 contains no repair or deletion capability.
+- Pull validates every byte/path, issues exactly one bearer capability at a time, and concurrent
+  pulls never replace an existing output.
+- Baseline filesystem contract tests pass on both Ubuntu and macOS; full PostgreSQL/MinIO evidence
+  runs on Linux.
+- PostgreSQL/MinIO integration, Ruff, formatting, mypy, pytest, and `scripts/demo-v01.sh` pass.
 
-## M3 — Reliable direct upload and resume
+## M2 — Resumable multipart for large files
 
-**Goal:** Transfer opaque files to content-addressed object keys without routing bytes through API.
+**Goal:** Resume inside multi-gigabyte files while retaining M1 identity and create-only semantics.
 
 **Scope**
 
-- Add UploadSession and UploadPart persistence and state transitions.
-- Issue short-lived presigned single PUTs below 64 MiB and multipart URLs at or above 64 MiB.
-- Reconcile resumptions with S3 `ListParts`; refresh URLs and complete or abort sessions idempotently.
-- Skip blobs already verified as available.
+- Add real UploadPart persistence and API-controlled multipart create/list/complete/abort operations.
+- Select part size within provider limits and 10,000 parts; issue exact short-lived part URLs.
+- Reconcile `ListParts`, ambiguous completion, expiry, and provider `NoSuchUpload` outcomes.
+- Apply create-only preconditions when publishing the final content-addressed object.
 
 **Acceptance criteria**
 
-- API access logs and tests prove file bodies travel CLI-to-MinIO only.
-- Killing the CLI after arbitrary parts, then rerunning it, sends only missing/mismatched parts.
-- Part size is at least 5 MiB, at most 5 GiB, and dynamically large enough to stay within 10,000
-  parts; all non-final parts are equal-sized.
-- URL expiry, duplicate part acknowledgement, duplicate completion, `NoSuchUpload`, timeout, and
-  retryable 5xx paths have deterministic recovery tests.
-- Explicit abort and stale-session cleanup remove incomplete provider uploads and preserve completed
-  objects.
+- A synthetic file above the M1 single-PUT limit uploads and pulls byte-identically.
+- Killing the CLI after arbitrary parts sends only absent/mismatched parts on rerun.
+- Concurrent completion cannot overwrite a completed Blob and converges on one object.
+- Part receipts remain opaque; final integrity follows the approved provider-checksum/fallback
+  contract rather than treating ETag as SHA-256.
 
-## M4 — Verification, publication, and safe download
+## M3 — Upload lifecycle cleanup and operator diagnosis
 
-**Goal:** Publish only byte-verified versions and reconstruct them safely.
+**Goal:** Bound abandoned multipart state and make observed transfer failures diagnosable.
 
 **Scope**
 
-- Implement idempotent version finalization and server-side full-object SHA-256 verification.
-- Add presigned GET download planning and CLI reconstruction using temporary files.
-- Enforce `DRAFT -> UPLOADING -> VERIFYING -> READY | FAILED`, explicit
-  `FAILED -> UPLOADING` repair, and blob availability rules. `READY` remains terminal.
+- Reconcile idle sessions, explicitly abort expired multipart uploads, and document provider
+  lifecycle cleanup as a second layer.
+- Add safe structured correlation and operator runbooks without automatic Blob deletion/repair.
 
 **Acceptance criteria**
 
-- Corrupt, truncated, reordered, or wrong-key objects can never make a version `READY`.
-- Verification can be retried after transport failure without changing manifest identity.
-- Download refuses non-`READY` versions, symlinks, destination escapes, collisions, and silent
-  overwrites.
-- Interrupted or corrupted downloads expose no completed file; successful files match manifest size
-  and SHA-256 before atomic placement.
-- An integration test proves two logical paths and versions can safely reuse one verified blob.
+- Cleanup never deletes a completed object or mutates an `AVAILABLE` Blob/`READY` Version.
+- Crash windows and `NoSuchUpload` converge deterministically under integration tests.
+- Logs expose stable resource identifiers/actions but no credentials, absolute paths, dataset bytes,
+  or presigned query strings.
 
-## M5 — Release hardening and v0.1 evidence
+## M4 — Threat and platform contract hardening
 
-**Goal:** Demonstrate the observed workflow reliably and document its operating limits.
+**Goal:** Prove the supported Linux/macOS and trusted-network contracts under adversarial inputs.
 
 **Scope**
 
-- Exercise the threat model, failure matrix, cleanup, observability, and operator runbook.
-- Measure scan, upload, verification, and download behavior using synthetic small-file and large-file
-  datasets.
-- Finish public CLI/API documentation and upgrade/recovery instructions.
+- Extend the baseline Linux/macOS contract across additional kernel/filesystem versions and hostile
+  path/race corpora.
+- Deepen cursor, capability-expiry, conditional-write, and database-trigger adversarial testing
+  beyond the M1 correctness suite.
 
 **Acceptance criteria**
 
-- The complete workflow passes from a clean environment with a synthetic dataset containing nested
-  paths, duplicate content, many small files, and at least one 6 GiB file.
-- Forced interruption during multipart upload resumes correctly; forced corruption blocks `READY`;
-  download reproduces the manifest exactly.
-- Ruff, formatting, mypy, unit tests, PostgreSQL/MinIO integration tests, and threat regression tests
-  pass in CI.
-- Logs contain correlation identifiers but no presigned URLs, credentials, or absolute local paths.
-- README and operator documentation state measured limits and all v0.1 non-goals.
+- Security/path corpora and concurrent race tests pass on supported platforms.
+- Unsupported atomic publication fails closed; partial outputs are never presented as complete.
+- The threat model lists residual risks without claiming Windows, authentication, power-loss
+  durability, continuous scrubbing, or automatic repair.
+
+## M5 — v0.1 release evidence
+
+**Goal:** Demonstrate the observed workflow and publish measured operating limits.
+
+**Scope**
+
+- Run the complete failure matrix and synthetic small-/large-file scenarios from a clean clone.
+- Finish public CLI/API documentation, upgrade instructions, and operator recovery guidance.
+
+**Acceptance criteria**
+
+- A synthetic dataset with nested paths, duplicate content, many small files, and a file above 5 GB
+  survives forced multipart interruption and reconstructs exactly.
+- Forced poisoned-object and download-corruption scenarios stop safely with documented action.
+- Ruff, formatting, mypy, all unit/integration/security tests, and demos pass in CI.
+- README and operator docs state measured limits, supported platforms, and all v0.1 non-goals.
 
 ## Beyond v0.1
 

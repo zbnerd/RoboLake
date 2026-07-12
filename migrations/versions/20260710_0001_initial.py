@@ -14,7 +14,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Create no domain tables until the M2 registry milestone."""
+    """Create no domain tables in the M0 baseline."""
 
 
 def downgrade() -> None:

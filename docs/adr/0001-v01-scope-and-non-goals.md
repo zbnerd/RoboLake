@@ -22,11 +22,16 @@ RoboLake v0.1 will provide one complete workflow:
 3. register a dataset and content-fixed version;
 4. upload missing blobs reliably to S3-compatible object storage;
 5. resume interrupted uploads;
-6. verify full-file size and SHA-256 before publication; and
+6. verify size and SHA-256 through a documented storage contract before publication; and
 7. download a `READY` version and reconstruct its logical file tree.
 
 The CLI is a first-class interface. PostgreSQL stores searchable registry/workflow metadata; object
 storage stores raw file bytes. The API and CLI do not interpret file formats.
+
+The canonical manifest is deliberately minimal: schema version plus normalized regular-file paths,
+sizes, and SHA-256 values. Suffix-derived media/format hints, nested empty directories, permissions,
+ownership, timestamps, hard links, extended attributes, symlinks, and special files are excluded
+from snapshot identity. M1 contract-tests Linux/macOS; Windows/SMB behavior is not claimed.
 
 The following are explicit non-goals unless later evidence, an issue, and an ADR require them:
 
@@ -45,6 +50,8 @@ No generic plugin system, event bus, workflow engine, or downstream schema will 
 - Files such as MCAP and video are supported as bytes, not as semantic formats.
 - v0.1 is safe only inside a trusted deployment boundary because it has no authentication.
 - Empty directories, filesystem metadata, and downstream lineage are not represented.
+- Canonical manifest validity is deployment-independent; operational transfer limits may vary only
+  within protocol/provider maxima.
 - Any next scope must come from observed usage after v0.1, not from assumptions about training.
 
 ## Alternatives considered

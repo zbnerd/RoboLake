@@ -1,0 +1,25 @@
+name: Filesystem contract
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+
+jobs:
+  filesystem-contract:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: >-
+          uv run pytest
+          tests/unit/domain
+          tests/unit/infrastructure/test_scanner.py
+          tests/unit/infrastructure/test_atomic_tree.py
+          tests/unit/infrastructure/test_atomic_publish.py

@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: api check cli down example format format-check integration lint migrate ps sync test typecheck unit up
+.PHONY: api check cli demo down example format format-check integration lint migrate ps sync test typecheck unit up
 
 sync:
 	$(UV) sync
@@ -48,3 +48,6 @@ check: lint format-check typecheck test
 
 example:
 	$(UV) run robolake example generate examples/synthetic-dataset --seed 7
+
+demo:
+	scripts/demo-v01.sh
