@@ -62,20 +62,31 @@ later milestones must not be pulled forward as speculative infrastructure.
 
 **Goal:** Resume inside multi-gigabyte files while retaining M1 identity and create-only semantics.
 
+**Design status:** Approved — 2026-07-13. Implementation has not begun. See the
+[M2 product brief](M2_PRODUCT_BRIEF.md), [multipart architecture](M2_MULTIPART_ARCHITECTURE.md), and
+[implementation plan](M2_IMPLEMENTATION_PLAN.md).
+
 **Scope**
 
-- Add real UploadPart persistence and API-controlled multipart create/list/complete/abort operations.
-- Select part size within provider limits and 10,000 parts; issue exact short-lived part URLs.
-- Reconcile `ListParts`, ambiguous completion, expiry, and provider `NoSuchUpload` outcomes.
-- Apply create-only preconditions when publishing the final content-addressed object.
+- Keep the M1 single-PUT path through 5,000,000,000 bytes; add UploadPart persistence only above it.
+- Freeze a deterministic 64 MiB-based plan within provider limits and 10,000 parts; issue an exact
+  rolling window of short-lived part URLs.
+- Reconcile paginated `ListParts`, ambiguous completion, explicit abort, and `NoSuchUpload` outcomes.
+- Complete directly at the final content-addressed key with `If-None-Match: *`, then stream the final
+  object once to prove whole-file SHA-256 before `AVAILABLE`.
+- Bound abandoned incomplete MPUs with same-workflow abort and provider stale-upload expiry; do not
+  add temporary objects, final-object deletion, automatic repair, or general Blob GC.
 
 **Acceptance criteria**
 
 - A synthetic file above the M1 single-PUT limit uploads and pulls byte-identically.
 - Killing the CLI after arbitrary parts sends only absent/mismatched parts on rerun.
 - Concurrent completion cannot overwrite a completed Blob and converges on one object.
-- Part receipts remain opaque; final integrity follows the approved provider-checksum/fallback
-  contract rather than treating ETag as SHA-256.
+- Lost Complete responses and `NoSuchUpload` converge through the deterministic final key.
+- Part receipts remain opaque; final integrity uses whole-byte SHA-256 and never treats ETag or a
+  multipart composite checksum as Blob identity.
+- Normal PR CI uses small multipart fixtures; a scheduled/manual >5,000,000,000-byte profile proves
+  bounded memory, resume, final publication, pull, and byte equality.
 
 ## M3 — Upload lifecycle cleanup and operator diagnosis
 
