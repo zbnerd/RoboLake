@@ -5,10 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "robolake"
 version = "0.1.0"
-description = "Robot dataset transfer and registry platform"
+description = "Immutable dataset registry for large robotics data"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "alembic>=1.16,<2",
     "boto3>=1.39,<2",

@@ -1,14 +1,57 @@
 # RoboLake
 
-RoboLake is an open-source robot dataset transfer and registry platform. M1 scans a local
-regular-file tree, registers an immutable DatasetVersion, transfers unique SHA-256-addressed Blobs
-directly to S3-compatible storage, and reconstructs the tree byte-for-byte.
+RoboLake is an immutable dataset registry for large robotics data. It transfers regular-file-tree
+snapshots into content-addressed object storage using deterministic manifests, integrity
+verification, deduplication, resumable file-level push, and atomic pull.
+
+Robot teleoperation datasets commonly live on NAS appliances or researcher workstations and are
+copied manually to training servers. Those transfers can fail, repeat bytes, lose provenance, or
+leave a directory whose completeness is unclear. RoboLake v0.1.0 makes that one workflow explicit
+and verifiable.
+
+## What v0.1.0 does
+
+- Scans a Linux/macOS regular-file tree without following symlinks.
+- Builds a deterministic manifest of relative paths, sizes, and SHA-256 digests.
+- Registers immutable DatasetVersions and deduplicated content-addressed Blobs.
+- Pushes missing Blobs directly to S3-compatible storage with create-only presigned requests.
+- Resumes an interrupted push at verified whole-file boundaries.
+- Pulls a READY Version, verifies every byte, and atomically publishes the reconstructed tree.
+
+Run the complete synthetic demo from a clone with Docker and Python 3.12:
+
+```bash
+scripts/demo-v01.sh
+```
+
+v0.1.0 intentionally does not provide multipart upload, within-file or pull resume, authentication,
+multi-tenancy, ROS2/MCAP interpretation, training workflows, a frontend, or continuous storage
+scrubbing. It is not a complete robot MLOps platform or a production-ready SaaS service.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    FS[Local or NAS directory] --> SCAN[Safe scanner<br/>canonical manifest]
+    SCAN --> PG[(PostgreSQL<br/>DatasetVersion registry)]
+    SCAN --> S3[(MinIO / S3<br/>content-addressed Blobs)]
+    PG --> READY[READY immutable snapshot]
+    S3 --> READY
+    READY --> GET[One capability at a time<br/>verified pull]
+    GET --> OUT[Atomic local publication]
+```
+
+The CLI sends control metadata to FastAPI and transfers file bytes directly to object storage using
+short-lived presigned URLs. PostgreSQL stores logical identity and workflow state; MinIO stores raw
+immutable Blob bytes. See the [architecture overview](docs/ARCHITECTURE_OVERVIEW.md) and
+[ADR index](docs/ADR_INDEX.md) for the decisions behind these boundaries.
 
 ## Requirements
 
 - Python 3.12
 - [uv 0.11.28+](https://docs.astral.sh/uv/getting-started/installation/)
 - Docker Engine with Docker Compose
+- Linux or macOS for the supported filesystem contract
 
 Install the pinned uv version without changing shell configuration:
 
@@ -17,14 +60,13 @@ curl -LsSf https://astral.sh/uv/0.11.28/install.sh \
   | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh
 ```
 
-## Quickstart
-
-From the repository root, start the M1 development environment:
+## Ten-minute quickstart
 
 ```bash
-docker compose up -d --wait
-uv sync
+uv sync --locked
+docker compose up -d --build --wait
 uv run alembic upgrade head
+
 uv run robolake example generate /tmp/robolake-demo --seed 7
 uv run robolake push /tmp/robolake-demo --dataset demo/pick-place
 uv run robolake status demo/pick-place@v1
@@ -33,20 +75,54 @@ uv run robolake pull demo/pick-place@v1 --output /tmp/robolake-restored
 diff -qr /tmp/robolake-demo /tmp/robolake-restored
 ```
 
-Local services use ports chosen to avoid common workstation conflicts:
+Local endpoints:
 
 - API and OpenAPI: <http://localhost:18000>, <http://localhost:18000/docs>
 - PostgreSQL: `localhost:15432`
 - MinIO S3 API and console: <http://localhost:19000>, <http://localhost:19001>
 
-Check container state with `docker compose ps`; stop services with `docker compose down`.
+Check service health with:
+
+```bash
+curl --fail http://localhost:18000/health
+docker compose ps
+```
+
+Stop services without deleting their volumes with `docker compose down`.
+
+## CLI workflow
+
+```bash
+robolake push DIRECTORY --dataset NAMESPACE/NAME
+robolake status NAMESPACE/NAME@v1
+robolake manifest NAMESPACE/NAME@v1
+robolake pull NAMESPACE/NAME@v1 --output NEW_DIRECTORY
+```
+
+`push` returns only after the Version is READY. Repeating an unchanged push resolves the same
+Version and reuses verified Blobs. `status` separates logical file-tree progress from deduplicated
+content progress. `pull` refuses to replace an existing output directory.
+
+## Integrity and security boundary
+
+- Canonical manifests and file SHA-256 values define snapshot identity.
+- Blob object keys are derived from SHA-256 and are create-only.
+- Provider system checksums are reconciled before publication; missing checksums trigger a streamed
+  full-object verification fallback.
+- Downloads are written to private staging, checked, fsynced, and published atomically.
+- Presigned URLs are bearer capabilities and must never be logged or shared.
+- v0.1.0 has no authentication. Run it only inside a trusted network with external TLS and access
+  controls when traffic leaves the local Compose environment.
+
+Read the [security summary](docs/SECURITY_MODEL_SUMMARY.md), full
+[threat model](docs/THREAT_MODEL_V0_1.md), and
+[known limitations](docs/KNOWN_LIMITATIONS_V0.1.0.md) before deployment.
 
 ## Configuration
 
-[`.env.example`](.env.example) contains synthetic local-development values only. RoboLake loads it
-first and lets an ignored `.env` override values. All application settings use the `ROBOLAKE_`
-prefix. Compose also reads PostgreSQL and MinIO bootstrap values from these files. Never place real
-credentials in Git.
+[`.env.example`](.env.example) contains synthetic development values only. An ignored `.env` may
+override them. Application settings use the `ROBOLAKE_` prefix; Compose also reads PostgreSQL and
+MinIO bootstrap values. Never commit real credentials.
 
 Host ports can be changed without editing Compose:
 
@@ -54,46 +130,12 @@ Host ports can be changed without editing Compose:
 ROBOLAKE_API_PORT=28000 ROBOLAKE_MINIO_PORT=29000 docker compose up -d
 ```
 
-## Health
+M1 rejects any file larger than 5,000,000,000 bytes before creating registry or storage state.
 
-`GET /health` checks the application, PostgreSQL, and the configured object-storage bucket. Healthy
-dependencies return HTTP 200:
-
-```bash
-curl --fail http://localhost:18000/health
-```
-
-```json
-{"status":"ok","components":{"application":"ok","database":"ok","object_storage":"ok"}}
-```
-
-A failed dependency returns HTTP 503 and `down` without exposing provider exception details.
-
-## Synthetic example data
-
-Create a small deterministic nested tree containing no real robot data:
+## Development and verification
 
 ```bash
-uv run robolake example generate examples/synthetic-dataset --seed 7
-```
-
-The command refuses to overwrite a non-empty destination. The default generated directory is
-ignored by Git; remove it before changing the seed or rerunning the command.
-
-Run the repeatable synthetic end-to-end demonstration with:
-
-```bash
-scripts/demo-v01.sh
-```
-
-`push` is idempotent for an unchanged manifest and resumes at verified whole-Blob boundaries. M1
-processes unique Blobs sequentially and rejects a file above 5,000,000,000 bytes before creating
-registry state. Multipart and within-file resume begin in M2.
-
-## Development tasks
-
-```bash
-make up            # start and wait for local services
+make up            # start local services
 make migrate       # apply Alembic migrations
 make unit          # isolated tests
 make integration   # real PostgreSQL and MinIO tests
@@ -102,20 +144,23 @@ make demo          # synthetic push/status/manifest/pull verification
 make down          # stop services without deleting volumes
 ```
 
+The release checklist is [docs/RELEASE_CHECKLIST_V0.1.0.md](docs/RELEASE_CHECKLIST_V0.1.0.md).
+Measured M1 results are in [docs/reports/M1_BASELINE.md](docs/reports/M1_BASELINE.md).
+
 ## Repository structure
 
 ```text
 apps/api/                  FastAPI transport and composition
 apps/cli/                  Typer transport and composition
-robolake/domain/           framework-free domain boundary
-robolake/application/      framework-free use cases and ports
-robolake/infrastructure/   SQLAlchemy, S3, settings, local adapters
-migrations/                Alembic environment and revisions
-tests/unit/                isolated behavior and boundary tests
+robolake/domain/           framework-free identities and state rules
+robolake/application/      framework-free workflows and ports
+robolake/infrastructure/   PostgreSQL, S3, HTTP, filesystem adapters
+migrations/                Alembic revisions and database invariants
+tests/unit/                isolated domain and boundary tests
 tests/integration/         real PostgreSQL and MinIO contract tests
-docs/adr/                  architecture decisions
+docs/adr/                  accepted architecture decisions
+scripts/                   demo and benchmark entry points
 ```
 
-See [the v0.1 architecture](docs/ARCHITECTURE_V0_1.md) and
-[M0–M5 roadmap](docs/ROADMAP.md) for accepted scope. M1 adds no authentication, Kafka, Airflow,
-Iceberg, ROS2 integration, frontend, or model-training capability.
+See the [v0.1.0 release notes](docs/RELEASE_NOTES_V0.1.0.md), [changelog](CHANGELOG.md), and
+[M0–M5 roadmap](docs/ROADMAP.md). RoboLake is released under the [MIT License](LICENSE).
