@@ -12,33 +12,76 @@ sealed Blob or survive client/database response loss safely.
 
 ## Decision
 
-Extend the existing `UploadSession` with `MULTIPART` strategy and explicit `CREATED`, `IN_PROGRESS`,
-`COMPLETING`, `COMPLETED`, `ABORTING`, `ABORTED`, and `FAILED` attempt states. Add `UploadPart` rows
-with `PENDING`, `UPLOADED`, and `VERIFIED` states.
+Extend the existing `UploadSession` with `MULTIPART` strategy and explicit `CREATED`, `INITIATING`,
+`IN_PROGRESS`, `COMPLETING`, `COMPLETED`, `ABORTING`, `ABORTED`, `CANCELLED`, and `FAILED` attempt
+states. Add `UploadPart` rows with `PENDING`, `UPLOADED`, and `VERIFIED` states.
+
+Separate request replay, invocation ownership, and attempt identity:
+
+- `request_id` UUID idempotently maps one create/resolve request to one session and is never rebound;
+- `invocation_id` UUID identifies one CLI execution and its metrics/admission acquisition; and
+- immutable positive `session_generation` identifies one attempt within a Blob, with
+  `UNIQUE(blob_id, session_generation)` and at most one active generation.
+
+A new request first replays its immutable request record, otherwise locks the Blob and resolves the
+active session or creates `max(generation) + 1`. A new CLI invocation therefore resumes an active
+session, while a new request after a terminal 409, `NoSuchUpload`, cancellation, abort, or ambiguous
+initiation can create the next generation. Concurrent creators converge through the active-session
+partial unique index; terminal sessions are never reactivated.
 
 Capability issuance is optional diagnostic metadata, not part state, audit history, or transfer
-progress. Reissuance is permitted. Only provider-reconciled `VERIFIED` parts contribute to progress:
-PostgreSQL owns the immutable intended plan, while ListParts owns current provider presence.
+progress. Reissuance is permitted. Only `VERIFIED` parts contribute to progress: PostgreSQL stores
+the opaque UploadPart response ETag and normalized SHA-256 checksum while paginated ListParts proves
+current provider presence. Client input alone and ListParts-only ETags/checksums are insufficient
+completion receipts. Supported providers must return the requested response checksum. When the
+response receipt was lost, RoboLake re-uploads the same checksum/length-bound part number to obtain
+a new response receipt, then reconciles it.
 
-Part size starts at 64 MiB, doubles until at most 10,000 parts are needed, and caps at 5 GiB. The
-session freezes part size/count and exact number/offset/size/SHA-256 plan before provider initiation.
+Part size starts at 64 MiB, doubles until at most 10,000 parts are needed, and caps at 5 GiB. Blob
+size is capped at the portable AWS/MinIO intersection of 5,000,000,000,000 bytes. The
+session freezes part size/count and exact number/offset/size/SHA-256 plan in the committed `CREATED`
+registration, before provider initiation.
+Its `part_plan_sha256` is SHA-256 over schema-v1 canonical JSON with top-level order
+`schema_version`, `blob_size_bytes`, `part_size_bytes`, `part_count`, `parts`; each part orders
+`part_number`, `offset_bytes`, `size_bytes`, `sha256`. UTF-8, compact separators, no trailing newline,
+JSON integers only, ascending part number, and lowercase 64-character digests are normative.
 Provider IDs and ETags are opaque operational receipts. Different part numbers may carry identical
 bytes and therefore identical expected hashes, provider checksums, and ETags; uniqueness applies
 only to part number and the frozen non-overlapping ranges. PostgreSQL owns intent; paginated
 ListParts owns current provider presence. One persistent active session per Blob and database
 triggers enforce identity, plan, transition, and completion structure.
 
-Separate the persistent resumable session from a short-lived admission lease. The lease stores an
-invocation owner UUID, monotonically increasing epoch, and expiry. Only unexpired leases count
-toward the global execution cap. Every mutating operation is fenced by the current owner/epoch;
-lease expiry never expires or aborts the session/provider MPU. An expired lease may be atomically
-reacquired with a higher epoch.
+Separate the persistent resumable session from a short-lived upload admission lease. Acquisition is
+idempotent by request UUID and invocation UUID; the server generates the lease owner UUID and epoch.
+Only unexpired leases count toward the upload cap. Repository mutations use atomic SQL predicates
+over session, owner, epoch, and database-time expiry; a zero-row write is
+`ADMISSION_LEASE_LOST`. Structural triggers do not claim to authenticate caller fence values.
+
+Completion is separately server-owned. The complete request validates the upload fence and freezes
+reason `PARTS_READY` (all receipt-backed) or `FINAL_PRESENT` (adoption path) for that accepted work item, atomically sets
+`COMPLETING`, releases the upload lease, and returns 202. A bounded runner using the same
+application artifact claims PostgreSQL `COMPLETING` rows with a distinct completion owner/epoch and
+lease. Default completion concurrency is 2 (hard maximum 8); default lease/heartbeat are 120/30
+seconds. It heartbeats in short transactions at most one third of TTL throughout provider Complete
+and the full stream. A stale runner cannot commit evidence, Blob AVAILABLE, or terminal state; a
+takeover reconciles final state and restarts interrupted full GET from byte zero.
+
+Provider initiation has an explicit crash boundary. `CREATED` means no provider request was sent and
+may become `CANCELLED`. The API records `INITIATING` before CreateMultipartUpload. Only a durably
+stored upload ID permits `IN_PROGRESS`; response loss or process failure before that commit becomes
+terminal `FAILED` with initiation-ambiguous reason. If the process still knows the in-memory ID after
+a DB failure it may best-effort abort without claiming success. An abort while `INITIATING` returns a
+retryable in-progress error, and an unaddressable orphan relies on provider lifecycle cleanup rather
+than a false abort claim.
 
 `COMPLETING -> IN_PROGRESS` is legal only when the final key is absent, the same provider MPU still
-exists, completion was not 409, and a complete structurally valid ListParts result contains a proper
-subset of matching parts. Matches stay VERIFIED and unresolved parts return to PENDING. A 409 or
-`NoSuchUpload` with no final terminates the provider attempt; a new session/MPU starts with every
-part unresolved and adopts no old receipt.
+exists, completion was not 409, and a complete structurally valid ListParts result supports safe
+requeue. Ordinary completion ambiguity requires a proper subset of receipt-backed matching parts;
+a vanished `FINAL_PRESENT` observation may requeue a fully receipt-backed set for new
+`PARTS_READY` acceptance. Matches stay VERIFIED and unresolved or receipt-less parts return to
+PENDING. A 409 or
+`NoSuchUpload` with no final terminates the provider attempt; a new request allocates the next
+generation/MPU with every part unresolved and no adopted old receipt.
 
 The official CLI rehashes the complete file and deterministic parts before resumed transfer,
 streams exact positional ranges, and uses a rolling capability window equal to configured
@@ -67,12 +110,16 @@ and reject the second before another byte is sent.
 ## Consequences
 
 - Resume reuses only provider-proven, exact parts and survives CLI/API restarts.
+- A missing UploadPart response receipt causes only that exact part to be retransmitted for portable
+  completion; ListParts observations alone never become the completion manifest.
 - Up to 10,000 rows and provider receipts are stored per active large Blob.
 - Every resumed invocation rereads the local file to prove identity before adding parts.
 - Abandoned invocations release capacity when their lease expires without discarding resumable
   session/provider progress.
-- Lease fencing adds heartbeat and takeover transactions; an already dispatched provider request
-  may settle and must be reconciled by the current owner.
+- Upload and completion leases add separate heartbeat/takeover transactions; an already dispatched
+  provider request may settle and must be reconciled by the current owner.
+- PostgreSQL supplies the completion work registry and claim source without Kafka, Celery, or another
+  external queue. A failed verification restarts from byte zero in M2.
 - `ABORTING` is required because abort and DB acknowledgements can be lost independently.
 - M1 manifests, Blob/Version identity, single-PUT rows, metrics, and pull semantics do not change.
 

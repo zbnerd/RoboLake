@@ -10,7 +10,10 @@ prospective M2 threshold, 72-hour application-session expiry, and provider-check
 are superseded by proposed ADRs [0008](0008-multipart-session-model.md),
 [0009](0009-multipart-final-publication.md), and [0010](0010-multipart-reconciliation.md) if PR #5
 is merged. The M2 design uses the released 5,000,000,000-byte threshold, persistent resumable
-sessions plus expiring admission leases, and mandatory full-stream verification.
+generation-numbered sessions plus separate upload/completion leases, retained UploadPart response
+ETags rather than ListParts-only completion receipts, asynchronous PostgreSQL-claimed completion,
+and mandatory full-stream verification. These proposed changes do not alter this ADR's released M1
+decision.
 
 ## Context
 

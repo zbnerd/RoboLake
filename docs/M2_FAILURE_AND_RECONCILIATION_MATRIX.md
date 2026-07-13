@@ -2,84 +2,106 @@
 
 ## Rules applied to every row
 
-Reconciliation validates the current admission lease for mutations, locks the session, reads the
-deterministic final key before interpreting `NoSuchUpload`, paginates all provider parts, and
-compares provider facts with the frozen database plan. The API never trusts a client ETag, provider
-error body, or user metadata as integrity proof. Idempotency scope is
-`(operation, session_id, caller_key)`; reuse with a different canonical request digest returns
-`IDEMPOTENCY_CONFLICT`.
+Request identity, CLI invocation identity, and session generation are separate. One immutable
+`request_id` record maps to one canonical request/result and is never rebound. A new invocation
+resumes the one active Blob generation; a terminal provider attempt requires a new request UUID and
+the next generation. Concurrent resolve holds a Blob lock and converges through
+`UNIQUE(blob_id, session_generation)` plus the one-active-generation partial index.
 
-Automatic replacement/deletion is allowed only for a numbered part inside the same incomplete
-provider upload. No path overwrites or automatically deletes a completed final object, and an
-`AVAILABLE` Blob is never mutated. Part ETags/checksums are per-part observations and need not be
-unique.
+Upload-phase mutations validate the current upload admission lease through atomic repository SQL.
+Completion is accepted as durable `COMPLETING` work, releases the upload lease, and is performed by a
+server runner under a distinct completion lease. Reconciliation reads the deterministic final key
+before interpreting `NoSuchUpload`, paginates every provider part, and compares provider facts with
+the frozen database plan and stored UploadPart response receipts. No provider call is made inside a
+long database transaction.
 
-Invocation metrics classify a matching part exactly once:
+The API never trusts a client receipt, provider error body, ETag, checksum metadata, or user metadata
+as whole-object integrity proof. A stored UploadPart response receipt becomes usable only after
+ListParts currently matches its part number, size, expected checksum, response checksum, and ETag.
+ListParts-only ETags/checksums are never adopted as completion receipts.
 
-- `reused_provider_part_*`: present during initial reconciliation before this invocation attempts it;
-- `newly_transferred_part_*`: this invocation receives unambiguous UploadPart success and later
-  provider verification; or
+Automatic replacement/deletion is allowed only for a numbered part inside the same incomplete MPU.
+No path overwrites or automatically deletes a completed final object, and an `AVAILABLE` Blob is
+never mutated. Part receipts/checksums may repeat across part numbers.
+
+Invocation metrics classify a resolved part exactly once:
+
+- `reused_provider_part_*`: receipt-backed and matching during initial reconciliation before this
+  invocation attempts it;
+- `newly_transferred_part_*`: this invocation receives an unambiguous UploadPart response receipt
+  and the provider observation later matches; or
 - `reconciled_part_*`: discovered after a lost/ambiguous response, concurrent write, or otherwise
-  unprovable transfer ownership.
+  unprovable transfer ownership. A missing response receipt still forces an exact re-upload.
 
-These are payload-accounting categories, not exact wire bytes.
+These are payload-attribution categories, not exact wire bytes.
 
 ## Matrix
 
 | # | Observed disagreement | Resulting state and deterministic action | Retry/action | Automatic mutation and idempotency |
 | ---: | --- | --- | --- | --- |
-| 1 | DB part `PENDING`; provider has no part | Keep `PENDING`; issue an exact capability inside the rolling window. | `RETRY_PUSH`. | No deletion. Repeated reconcile is unchanged. |
-| 2 | Initial reconciliation: DB `PENDING`; provider has a matching part | Store opaque receipt and mark `VERIFIED`; classify as reused. | Continue automatically. | Safe adoption only. Duplicate ETag/checksum across other part numbers is valid. |
-| 3 | DB `UPLOADED` or `VERIFIED`; provider has no part | Reset to `PENDING`; DB receipt contributes no progress. | `RETRY_PUSH`. | Replace only by a later exact UploadPart in the same MPU. |
-| 4 | Provider part size/checksum differs | Record size/checksum error and reset that part to `PENDING`. | `RETRY_PUSH`; repeated mismatch stops scheduling for this invocation. | Same-number replacement with frozen bytes only. |
-| 5 | API committed completion; client lost API response | Session/Blob already show `COMPLETED`/`AVAILABLE`; replay returns the same safe result. | Success. | Idempotency record returns the original response. |
-| 6 | Provider completed; API lost provider response | DB remains `COMPLETING`; HEAD finds final and full-stream SHA-256 decides completion or mismatch. | Match succeeds; mismatch `CONTACT_OPERATOR`. | No repeated write or final deletion. |
-| 7 | Complete retried; final absent; same MPU lists every matching part | Remain `COMPLETING` and retry conditional Complete with provider-reconciled receipts. | Safe retry; 412 is reconciliation. | No state regression or part rewrite. |
-| 8 | Complete ambiguous/non-409; final absent; same MPU has a valid subset | Record final absence and full ListParts result, take guarded `COMPLETING -> IN_PROGRESS`, keep matches `VERIFIED`, reset unresolved parts `PENDING`. | Re-upload unresolved parts only. | Same upload ID and frozen plan only; transition is idempotent. |
-| 9 | Complete returns 409; final absent | Mark attempt `FAILED` with provider-attempt invalidation, release lease, and create/resolve a new session/MPU. | `FINAL_BLOB_PUBLICATION_CONFLICT`/`RETRY_PUSH`. | No old upload ID, row, ETag, checksum, or part may count in the new session; upload every part again. |
-| 10 | Provider says `NoSuchUpload`; final absent | Cause is unknowable. Mark attempt `FAILED`, release lease, and create/resolve a new session/MPU. | `MULTIPART_SESSION_NOT_FOUND`/`RETRY_PUSH`. | Same full restart rule as row 9; no `EXPIRED` claim. |
-| 11 | Final Blob exists and matches | Reuse existing AVAILABLE attestation, or stream full bytes and record application verification evidence before AVAILABLE. | Success/reuse. | Adoption only. A losing incomplete MPU may be explicitly aborted. |
-| 12 | Final Blob exists and mismatches | Session `FAILED`; Blob remains non-AVAILABLE. | `STORED_OBJECT_MISMATCH`/`CONTACT_OPERATOR`, exit 5. | Never overwrite/delete; runbook only. |
-| 13 | Complete returns 412 | Another publisher likely won. Apply row 11 or 12; 412 alone is not success. | Match succeeds; mismatch operator. | Losing MPU may be aborted; final untouched. |
-| 14 | Two provider MPUs target the same missing Blob | DB normally converges callers on one active session; out-of-band duplicates may continue. Conditional completion allows one final winner. | Loser reconciles final and reports reused Blob. | No cross-session part adoption. |
-| 15 | One session publishes while another has in-flight parts | Publisher verifies final and marks Blob AVAILABLE. Other invocation stops scheduling and reconciles. | Loser succeeds by final reuse when matching. | Late same-MPU part writes never change the completed final; losing incomplete MPU is aborted if present. |
-| 16 | UploadPart response is unambiguously successful | Mark `UPLOADED`; ListParts match advances to `VERIFIED`. | Continue. | Classify as newly transferred only after provider verification. |
-| 17 | UploadPart response is lost or ambiguous | Reconcile part number. Matching becomes `VERIFIED`; absent remains `PENDING`. | Retry only if absent/mismatch. | Matching part is `reconciled_part_*`, not newly transferred or reused. |
-| 18 | Concurrent/late capability writes a matching part after initial reconciliation | Current lease owner later discovers it through ListParts. | Continue. | Classify as reconciled because transfer ownership is not provable. |
-| 19 | CreateMultipartUpload response is lost before DB stores upload ID | DB remains `CREATED`; provider may retain an unaddressable MPU. Record initiation failure and safely initiate again. | `RETRY_PUSH`. | Never guess upload IDs; provider lifecycle bounds unknown residue. |
-| 20 | Abort succeeds; DB update fails | DB remains `ABORTING`/earlier; replay finds `NoSuchUpload` and records `ABORTED`. | Safe retry. | Reconciliation, not response, establishes absence. |
-| 21 | DB records abort intent; provider abort fails | Keep `ABORTING`; retry after in-flight requests settle. If final appears, verify it instead. | `RETRY_PUSH`. | Never claim ABORTED before absence. |
-| 22 | Complete HTTP 200 contains embedded `<Error>` | Adapter surfaces failure; remain `COMPLETING`, then apply rows 6–10. | Fact-dependent retry. | HTTP status alone never changes Blob/session. |
-| 23 | 64 sessions are abandoned and all leases expire | Sessions and provider MPUs remain resumable; active lease count becomes zero. A new invocation may acquire capacity. | Continue automatically. | No session/part deletion, abort, or GC. |
-| 24 | Two invocations race to reacquire one session's expired lease | Advisory-lock transaction updates one lease owner and increments epoch once; loser receives `ADMISSION_LEASE_HELD`. | Loser `RETRY_PUSH`. | One current owner/epoch; provider MPU unchanged. |
-| 25 | Old invocation mutates after lease takeover | Repository rejects owner/epoch or expiry mismatch before DB mutation/provider control call. | `ADMISSION_LEASE_LOST`/`RETRY_PUSH`. | Stale invocation cannot confirm, complete, abort, or change state. |
-| 26 | Old invocation's previously issued UploadPart URL completes after lease loss | Provider may accept the exact signed part. Stale caller still cannot confirm. Current owner reconciles it. | Continue under current owner. | Treat as reconciled; no stale DB authority. |
-| 27 | Lease expires while an API-owned provider control call is already in flight | Provider outcome may settle, but post-call DB write is fenced. Current owner resolves final key/ListParts. | `RETRY_PUSH` by current owner. | Fencing cannot cancel an already dispatched network request; deterministic reconciliation preserves safety. |
-| 28 | Completed temporary object exists | **Not representable in Option A.** Unexpected temp namespace content is operator-owned residue. | N/A. | No adoption or automatic deletion. |
+| 1 | DB part `PENDING`; provider has no part | Keep `PENDING`; issue exact capability inside rolling window. | `RETRY_PUSH`. | No deletion. Replay unchanged. |
+| 2 | Initial reconcile: DB retains a response receipt and provider has matching part | Store listing observation, mark `VERIFIED`, classify reused. | Continue. | Duplicate ETag/checksum on other numbers is valid. |
+| 3 | Provider has matching part but DB has no complete UploadPart response receipt | Keep/reset `PENDING`; classify ambiguous observation as reconciled; re-upload exact part to obtain response ETag/checksum, then ListParts-verify. | Continue with safe retransmission. | Never copy ListParts observations into response-receipt fields. |
+| 4 | DB `UPLOADED`/`VERIFIED`; provider has no part | Reset `PENDING`; receipt contributes no progress. | `RETRY_PUSH`. | Replace later with exact frozen bytes in same MPU. |
+| 5 | Provider part size/checksum or listed ETag differs from stored receipt | Record diagnostic mismatch and reset `PENDING`; exact re-upload captures a fresh response receipt. | `RETRY_PUSH`; repeated mismatch stops this invocation. | Same-number replacement only. |
+| 6 | Completion request commits `COMPLETING`, but 202 response is lost | Upload lease is released; durable work remains claimable. Same request ID replays, status shows `COMPLETING`. | Poll/retry safely. | No duplicate job row or provider call from request handler. |
+| 7 | CLI disconnects or times out after 202 | Runner continues independently; CLI rerun/status observes current state. | No transfer restart solely due disconnect. | Client does not own/cancel completion. |
+| 8 | Provider completed; runner lost Complete response | Session stays `COMPLETING`; current or takeover runner HEADs final and full-stream SHA-256 decides. | Match succeeds; mismatch `CONTACT_OPERATOR`. | No repeated write or final deletion. |
+| 9 | Complete reconciliation: final absent; same MPU lists every receipt-backed matching part | Remain `COMPLETING`; retry conditional Complete using stored UploadPart response ETags. | Safe retry; 412 triggers final reconciliation. | ListParts is verification, not receipt source. |
+| 10 | Ambiguous non-409 Complete; final absent; same MPU has valid receipt-backed subset | Guarded `COMPLETING -> IN_PROGRESS`; keep matches `VERIFIED`, reset missing/mismatching/receipt-less parts `PENDING`, release completion lease. | CLI reacquires upload lease and uploads unresolved parts. | Same upload ID/frozen plan only. |
+| 11 | Complete returns 409; final absent | Generation becomes terminal `FAILED` with provider-attempt invalidation; release completion lease; best-effort abort old MPU. | `FINAL_BLOB_PUBLICATION_CONFLICT`/`RETRY_PUSH`. | New request allocates generation+1; every part starts PENDING; no old ID/receipt adopted. |
+| 12 | Provider says `NoSuchUpload`; final absent | Cause unknowable; same terminal/new-generation rule as row 11. | `MULTIPART_SESSION_NOT_FOUND`/`RETRY_PUSH`. | Never call it EXPIRED or reuse the generation. |
+| 13 | Final object exists, including before this session resolves every part, and full bytes match | Accept/retain `COMPLETING` reason `FINAL_PRESENT`; stream all bytes and record fenced evidence before AVAILABLE. Incomplete parts stay unresolved. | Success/reuse. | Adoption only; known losing MPU is best-effort aborted, with provider lifecycle fallback. |
+| 14 | Final object exists and mismatches | Generation `FAILED`; Blob remains non-AVAILABLE. | `STORED_OBJECT_MISMATCH`/`CONTACT_OPERATOR`, exit 5. | Never overwrite/delete; runbook only. |
+| 15 | Complete returns 412 | Another publisher likely won. Apply row 13 or 14; 412 alone is not success. | Match succeeds; mismatch operator. | Final untouched. |
+| 16 | Two callers resolve same missing Blob concurrently | Blob lock/active unique index yields one active generation; both new request IDs bind to it. | Both may resume; only lease owner mutates. | No duplicate generation or request rebinding. |
+| 17 | Out-of-band second MPU targets same final key | Conditional completion permits one final winner; loser reconciles final. | Matching loser succeeds by reuse. | No cross-session part adoption. |
+| 18 | UploadPart response succeeds unambiguously | Store opaque response ETag/checksum as `UPLOADED`; ListParts match advances to `VERIFIED`. | Continue. | Classify newly transferred only after verification. |
+| 19 | UploadPart response is lost/ambiguous but ListParts finds matching bytes | No durable completion receipt exists. Reissue capability and re-upload exact part; store new response receipt and verify again. | Safe retransmission. | Classify reconciled; do not call exact wire bytes. |
+| 20 | Late stale capability replaces a part after lease loss | Current owner compares ListParts with retained receipt. Match may remain; receipt mismatch resets and re-uploads. | Continue under current owner. | Stale caller has provider write capability, never DB authority. |
+| 21 | `CREATED` session is cancelled | Transition directly to terminal `CANCELLED`; no provider request or cleanup. | Future push uses new request/generation. | Never enter `ABORTING`. |
+| 22 | Abort requested while `INITIATING` | No durable provider ID can be addressed; remain `INITIATING` until outcome resolves. | `MULTIPART_INITIATION_IN_PROGRESS`/`RETRY_PUSH`. | No guessed abort. |
+| 23 | Create response/DB commit is ambiguous, or initiating process dies and its lease expires with no durable ID | Current or later fenced owner marks generation `FAILED`/`INITIATION_AMBIGUOUS`; best-effort abort only if process still knows ID. Never repeat Create in that generation. | CLI uses a fresh request UUID for the next generation. | Unknown provider outcome remains lifecycle-owned. |
+| 24 | Abort succeeds; DB update fails | DB remains `ABORTING`; replay proves `NoSuchUpload` then records `ABORTED`. | Safe retry. | Reconciliation establishes absence. |
+| 25 | DB records abort intent; provider abort fails | Keep `ABORTING`; retry after in-flight writes settle. If final appears, enqueue `COMPLETING` and release upload lease for runner verification. | `RETRY_PUSH`/poll. | Never claim ABORTED early or run long verification under upload admission. |
+| 26 | Complete HTTP 200 embeds `<Error>` | Adapter surfaces failure; remain `COMPLETING`, then apply rows 8–12. | Fact-dependent retry. | HTTP status alone changes nothing. |
+| 27 | 64 upload invocations disappear and leases expire | Sessions/MPUs remain resumable; active upload lease count becomes zero. | New invocation may acquire capacity. | No session deletion, abort, or GC. |
+| 28 | Two invocations race to reacquire one expired upload lease | Atomic acquisition updates one owner and increments epoch; loser receives `ADMISSION_LEASE_HELD`. | Loser `RETRY_PUSH`. | One current owner/epoch. |
+| 29 | Stale upload owner mutates after takeover | Atomic repository predicate affects zero rows. | `ADMISSION_LEASE_LOST`/`RETRY_PUSH`. | Cannot confirm, initiate, accept completion, abort, or change state. |
+| 30 | Upload lease expires while provider initiation/abort call is in flight | Provider outcome may settle; stale post-call DB write is fenced. Current/new invocation applies initiation or abort reconciliation rules. | Fact-dependent retry. | Fencing cannot cancel dispatched network I/O. |
+| 31 | Runner holds completion lease while full GET exceeds upload/API timeout | Independent heartbeat transactions renew completion lease; request/CLI timeouts are irrelevant. | Continue. | No upload lease is held. |
+| 32 | Completion runner dies during Complete or full GET | Heartbeats stop; state remains `COMPLETING`. After expiry, another runner claims next epoch and reconciles. | Automatic takeover. | Interrupted verification restarts at byte zero. |
+| 33 | Stale completion runner tries to record evidence/AVAILABLE after takeover | Atomic completion fence affects zero rows; observation is discarded. | Current runner continues reconciliation. | No stale evidence or terminal transition. |
+| 34 | Two runners race to claim one `COMPLETING` row | `SKIP LOCKED`/compare-and-set yields one current completion owner/epoch. | Other runner selects other work/backoff. | One active completion mutation owner. |
+| 35 | Completion lease expires while provider call still runs | New runner may take over; both provider outcomes are reconciled through deterministic final key. Only current epoch may commit. | Automatic reconciliation. | Conditional completion and fence preserve convergence. |
+| 36 | Completed temporary object exists | **Not representable in Option A.** Unexpected temp namespace content is operator-owned residue. | N/A. | No adoption or automatic deletion. |
+| 37 | `FINAL_PRESENT` object disappears before full verification | Reconcile the same provider MPU. If it exists with a structurally valid set, guarded requeue to `IN_PROGRESS`; keep matching receipt-backed parts, reset others, and require a new `PARTS_READY` acceptance before Complete. If the MPU is absent, terminalize this generation. | `RETRY_PUSH` or `MULTIPART_SESSION_NOT_FOUND`, based on provider facts. | Never manufacture receipts or call Complete from the stale adoption reason. |
 
 ## Complete-response decision tree
 
 ```mermaid
 flowchart TD
-    A[Complete parsed success/error/412/409<br/>or response lost] --> B{Blob already AVAILABLE?}
-    B -->|yes| C[Return idempotent success]
+    A[Runner owns current completion lease] --> B{Blob already AVAILABLE?}
+    B -->|yes| C[Record idempotent completion]
     B -->|no| D[HEAD deterministic final key]
     D -->|exists| E[Stream full GET and SHA-256]
-    E -->|matches| F[Record evidence<br/>AVAILABLE + COMPLETED]
+    E -->|matches| F[Fenced evidence<br/>AVAILABLE + COMPLETED]
     E -->|mismatch| G[STORED_OBJECT_MISMATCH<br/>CONTACT_OPERATOR]
-    D -->|absent| H{409?}
-    H -->|yes| I[FAILED provider attempt<br/>new session and full restart]
+    E -->|disappears| J
+    D -->|absent| H{prior result 409?}
+    H -->|yes| I[FAILED generation<br/>new request and full restart]
     H -->|no| J[ListParts same upload ID]
-    J -->|all expected| K[Remain COMPLETING<br/>retry conditional Complete]
-    J -->|valid subset| L[Guarded COMPLETING to IN_PROGRESS<br/>upload unresolved parts]
+    J -->|all receipt-backed| K[PARTS_READY: retry Complete<br/>FINAL_PRESENT: guarded requeue and reaccept]
+    J -->|valid receipt-backed subset| L[Guarded COMPLETING to IN_PROGRESS<br/>upload unresolved parts]
     J -->|NoSuchUpload| I
 ```
 
 ## Deletion boundary
 
-- Safe automatic action: replace an incomplete part at the same number with the frozen bytes;
-  abort the current workflow's incomplete MPU after explicit request or losing publication.
-- Deferred to provider lifecycle: unknown/untracked incomplete multipart uploads.
+- Safe automatic action: replace an incomplete part at the same number with frozen bytes; abort the
+  current workflow's known incomplete MPU after explicit request or losing publication.
+- Deferred to provider lifecycle: unknown/untracked incomplete MPUs, including initiation ambiguity.
 - Never automatic: delete any completed final key, any `AVAILABLE` Blob, or content referenced by a
   `READY` Version.
-- Operator-only: inspect and, outside RoboLake, remove a proven poisoned non-`AVAILABLE` final key.
+- Operator-only: inspect and, outside normal RoboLake workflow, remove a proven poisoned
+  non-`AVAILABLE` final key.

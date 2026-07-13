@@ -16,32 +16,51 @@ Use deterministic reconciliation rather than response interpretation:
 
 1. final key and existing AVAILABLE attestation first;
 2. full-byte final verification for any non-AVAILABLE object;
-3. paginated ListParts for an existing provider upload;
-4. frozen database plan for intended parts; and
-5. stable error/action based on the resulting facts.
+3. UploadPart response receipts retained in PostgreSQL;
+4. paginated ListParts for current provider presence/checksum verification;
+5. the frozen database plan for intended parts; and
+6. stable error/action based on the resulting facts.
 
-DB progress never overrides provider absence. A matching provider part becomes VERIFIED; absent or
+DB progress never overrides provider absence. A provider part becomes VERIFIED only when ListParts
+matches its frozen size/checksum and a stored UploadPart response ETag/checksum. A matching ListParts entry
+without a durable response receipt remains unresolved and is re-uploaded to obtain one. Absent or
 mismatching incomplete parts return to PENDING and may be replaced with the exact frozen bytes. A
 412 triggers final reconciliation. After an ambiguous non-409 completion, final absence plus a
 structurally valid partial ListParts result for the same existing MPU permits guarded
 `COMPLETING -> IN_PROGRESS`: matching parts stay VERIFIED and only unresolved parts are retried. If
-all parts remain, the session stays COMPLETING and retries Complete.
+all parts remain after an ordinary `PARTS_READY` completion ambiguity, the session stays COMPLETING
+and retries Complete. If a `FINAL_PRESENT` observation disappears, the session safely requeues even
+a fully matching set so only a new `PARTS_READY` acceptance may call Complete.
 
 A 409 with no matching final ends that provider attempt because AWS requires a new MPU. The old
 upload ID and its parts are never resumed: after abort/invalidation, `RETRY_PUSH` creates a new
 session/MPU and uploads every part again. `NoSuchUpload` plus matching final completes; with no final
-it uses the same full-restart rule and maps to `MULTIPART_SESSION_NOT_FOUND`. RoboLake does not infer
-provider expiry from `NoSuchUpload`.
+it uses the same full-restart rule and maps to `MULTIPART_SESSION_NOT_FOUND`. The next resolve uses a
+new request UUID and creates or converges on the next immutable session generation; an earlier
+request record is never rebound. RoboLake does not infer provider expiry from `NoSuchUpload`.
 
-Persistent sessions are fenced by separate expiring admission leases. Only unexpired leases count
-toward the global execution cap. Takeover increments the lease epoch without aborting the provider
+Persistent sessions are fenced during upload by separate expiring admission leases. Only unexpired
+leases count toward the upload cap. Takeover increments the lease epoch without aborting provider
 MPU; stale owners cannot mutate DB state or initiate control calls. A previously issued exact part
 URL or already dispatched API provider request may still settle, and the current owner reconciles
 that provider fact.
 
+Complete is accepted asynchronously. The upload lease ends when `COMPLETING` is committed, and a
+PostgreSQL-claimed server runner owns Complete plus full-object verification under a distinct
+renewable completion lease and independent short heartbeats throughout long I/O. Client disconnect
+does not cancel that work. A dead or fenced runner cannot commit; a later owner reconciles final state
+and repeats verification from byte zero if necessary.
+
+`CREATED` means provider initiation has not started and may become `CANCELLED`. `INITIATING` records
+that CreateMultipartUpload may have been sent but no upload ID is durable. It becomes `IN_PROGRESS`
+only with a stored ID. Response/commit loss becomes terminal initiation ambiguity; a new request may
+allocate the next generation while unaddressable residue is left to lifecycle cleanup. Abort during
+INITIATING is retryably rejected; `ABORTING` is legal only with a durable provider ID.
+
 Abort uses `ABORTING` until provider absence is proven. Explicit abort applies only to the same
 incomplete workflow; Ctrl-C preserves resumability. Provider seven-day stale cleanup bounds unknown
-Create-response-loss MPUs. No M2 background sweeper, final deletion, repair, or Blob GC is added.
+Create-response-loss MPUs and a known losing MPU whose best-effort completion-owner abort fails. No
+M2 background sweeper, final deletion, repair, or Blob GC is added.
 
 This supersedes only ADR 0004's prospective M2 expiry and reconciliation assumptions. It does not
 rewrite or invalidate ADR 0004's historical M1 decisions, the released single-PUT workflow, or any
@@ -57,9 +76,13 @@ write.
 ## Consequences
 
 - Every control operation is replayable across API instances without server-memory ownership.
+- Request replay never changes session identity; new requests after terminal attempts allocate the
+  next Blob-scoped generation.
 - ListParts pagination and final full reads add provider requests and latency.
-- Lease heartbeat/takeover adds operational DB writes but prevents abandoned invocations from
-  permanently exhausting the global admission cap.
+- Missing UploadPart response receipts cause safe exact-part retransmission even when ListParts shows
+  matching bytes; this is the cost of the AWS-documented completion-receipt contract.
+- Upload and completion lease heartbeat/takeover add operational DB writes but prevent abandoned
+  clients or workers from permanently exhausting their separate caps.
 - Retryable attempt failure does not invent a new DatasetVersion or mutate its manifest.
 - Operator intervention remains required for a mismatching final key.
 - M1 error envelope, derived actions, exit categories, and publication meanings remain intact.
@@ -70,9 +93,11 @@ write.
 
 Rejected because crashes can occur between provider and DB commits.
 
-### Trust client ETags/status
+### Trust an unverified client receipt or ListParts-only ETag
 
-Rejected because the client can lose responses and ETag is not integrity proof.
+Rejected because the client can lie/lose responses, AWS requires retaining UploadPart response ETags,
+and ETag is not integrity proof. RoboLake stores the response receipt only after confirm and requires
+matching current ListParts evidence before it becomes VERIFIED.
 
 ### Treat `NoSuchUpload` as definitive failure
 

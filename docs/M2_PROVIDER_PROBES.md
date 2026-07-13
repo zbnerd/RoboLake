@@ -21,6 +21,8 @@ Commands:
 docker compose up -d --wait
 docker inspect robolake-minio-1 --format '{{.Config.Image}} {{.Image}}'
 docker exec robolake-minio-1 minio --version
+curl -fsSL https://raw.githubusercontent.com/minio/minio/07c3a429bfed433e49018cb0f78a52145d4bedeb/cmd/utils.go \
+  | sed -n '285,300p'
 set -a
 . ./.env.example
 set +a
@@ -65,7 +67,7 @@ sent by `httpx.put` with those exact headers. No presigned URL or query string w
 | ---: | --- | --- | --- |
 | 1 | `create_multipart_upload(..., ChecksumAlgorithm="SHA256")` | 200 with opaque UploadId; no object visible at key. | Standard S3 behavior. |
 | 2 | Presign and execute `UploadPart` with signed length/SHA-256 | 200. Signed headers were exactly `content-length`, `host`, `x-amz-checksum-sha256`. Changing signed length/checksum returned 403. | AWS SigV4/UploadPart supports the same fields. Contract-test every provider. |
-| 3 | `list_parts` after part 1 | Returned number 1, exact 1,048,576-byte size, ETag, and matching `ChecksumSHA256`. | Standard API, but page size differs: AWS returns at most 1,000; implementation must paginate. |
+| 3 | `list_parts` after part 1 | Returned number 1, exact 1,048,576-byte size, ETag, and matching `ChecksumSHA256`. | Standard current-state evidence; AWS returns at most 1,000. It must be paginated and must not replace the UploadPart response receipt used for Complete. |
 | 4 | Upload identical bytes again at part number 1 | Same ETag/checksum and one listed part. | AWS documents same-number replacement. Exact replay is safe. |
 | 5 | Upload different bytes at part number 1 | Listed part was replaced; ETag and SHA-256 changed; count stayed one. | AWS documents replacement. This is why every capability must bind expected digest/length. |
 | 6 | Upload bytes with the wrong `ChecksumSHA256` | HTTP 400 `XAmzContentChecksumMismatch`; no valid part adopted. | Error code is MinIO-specific; rejection semantics are portable. CLI must not parse body/code. |
@@ -84,6 +86,7 @@ sent by `httpx.put` with those exact headers. No presigned URL or query string w
 | 19 | Concurrent conditional Complete from two MPUs to one key | Exactly one 200 and one 412; final bytes matched exactly one contender. Existing final survived a conditional challenge; losing MPU stayed listable and abortable. | AWS documents first-writer success and later 412; 409 is also possible. This is the selected publication primitive. |
 | 20 | List incomplete MPU, abort, list again | Count changed 1 -> 0 immediately. Compose config declares stale cleanup every 6 h with 168 h expiry. The seven-day timed expiry was not time-advanced or claimed as observed. | Explicit abort is standard. AWS recommends `AbortIncompleteMultipartUpload` lifecycle as a backstop; exact MinIO environment settings are provider-specific. |
 | 21 | Upload the same deterministic 6 MiB payload as part numbers 1 and 2 in one MPU, then ListParts | Both parts were present with different part numbers and equal sizes. Their ETags were identical and their provider `ChecksumSHA256` values were identical. The MPU was aborted; a final list of incomplete uploads returned zero probe MPUs. | ETag is opaque and content-derived implementations may repeat it for equal bytes. Neither ETag, provider checksum, nor expected digest may be unique across part numbers. Uniqueness belongs to part number and frozen range. |
+| 22 | Inspect `cmd/utils.go` at the exact server commit reported by the pinned image | `globalMaxObjectSize = 5 * humanize.TiByte`, `globalMinPartSize = 5 * humanize.MiByte`, and `globalMaxPartID = 10000`. | Source inspection, not a multi-TiB live upload. Combined with AWS's 5 TB maximum, it fixes RoboLake's portable M2 maximum at 5,000,000,000,000 bytes. |
 
 The independent review reproduced probe 21 with the application policy under a random synthetic
 `blobs/sha256/` key:
@@ -159,6 +162,30 @@ same opaque ETag and the same per-part checksum when their bytes are equal. This
 state, not a collision or plan error. The completion gate therefore checks an ordered receipt for
 every expected part number but never requires receipts or digests to be distinct.
 
+## UploadPart response receipt versus ListParts
+
+The MinIO probe retained each `upload_part(...)` response dictionary and constructed
+`provider_receipts` from that response's ETag/checksum. ListParts was used separately to verify
+provider presence, size, checksum, and (for MinIO) ETag equality. The probe did not establish that a
+ListParts-only ETag is a portable replacement for a lost UploadPart response receipt.
+
+AWS's multipart overview instructs clients to retain the part number and ETag returned by each
+UploadPart and explicitly says not to use the listing result as the Complete request source. The
+UploadPart API likewise says the response ETag must be retained for Complete. M2 therefore stores:
+
+- `upload_response_etag` and the requested SHA-256 response checksum from an unambiguous UploadPart
+  response; and
+- separate `listed_*` observations from paginated ListParts.
+
+Supported M2 providers must return the requested response checksum; absence fails the provider
+contract. The adapter normalizes provider base64 checksum values to lowercase hexadecimal before
+comparison and persistence. ListParts proves current provider state. It does not manufacture a
+missing response receipt. If an UploadPart response is lost but a matching part appears in
+ListParts, M2 reissues the exact
+checksum/length-bound capability, re-uploads that part, captures the new response receipt, and then
+verifies it again. Complete uses only ordered stored UploadPart response ETags. This behavior is
+AWS-documented but was not live-tested against AWS in this design task.
+
 ## Completion response contract
 
 The live MinIO success response was parsed by botocore as a normal completion result. The probe did
@@ -179,10 +206,12 @@ Official references:
 - [AWS conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
 - [AWS CompleteMultipartUpload API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html)
 - [AWS multipart overview](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)
+- [AWS UploadPart API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html)
+- [AWS ListParts API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListParts.html)
 - [AWS checksum types](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)
 - [AWS AbortMultipartUpload](https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html)
 - [AWS multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)
-- [MinIO limits](https://min.io/docs/minio/kubernetes/openshift/operations/concepts/thresholds.html)
+- [Pinned MinIO server limit constants](https://github.com/minio/minio/blob/07c3a429bfed433e49018cb0f78a52145d4bedeb/cmd/utils.go#L285-L296)
 
 ## Unproven items
 
@@ -194,5 +223,8 @@ Official references:
   injected in CI.
 - Seven-day stale-upload expiry was configured but not observed by waiting or changing server time.
 - AWS was not contacted by these probes; AWS portability statements come from official API/user
-  documentation and require a future live AWS contract run before claiming AWS as tested.
+  documentation. In particular, response-receipt retention versus ListParts-only completion needs a
+  future live AWS contract run before claiming AWS as tested.
 - Multi-gigabyte throughput and memory were not measured in this design task.
+- The 5 TiB pinned-MinIO maximum was source-inspected, not exercised by uploading a multi-TiB
+  object. RoboLake deliberately uses AWS's lower 5 TB maximum as its cross-provider protocol bound.

@@ -71,18 +71,26 @@ later milestones must not be pulled forward as speculative infrastructure.
 - Keep the M1 single-PUT path through 5,000,000,000 bytes; add UploadPart persistence only above it.
 - Freeze a deterministic 64 MiB-based plan within provider limits and 10,000 parts; issue an exact
   rolling window of short-lived part URLs.
-- Reconcile paginated `ListParts`, ambiguous completion, explicit abort, and `NoSuchUpload` outcomes.
-- Keep persistent resumable sessions separate from expiring, fenced admission leases so abandoned
-  invocations cannot permanently consume the global execution cap.
-- Complete directly at the final content-addressed key with `If-None-Match: *`, then stream the final
-  object once to prove whole-file SHA-256 before `AVAILABLE`.
+- Separate immutable request replay, CLI invocation metrics, and Blob-scoped provider-attempt
+  generations; make provider initiation ambiguity explicit.
+- Retain UploadPart response ETags and SHA-256 checksums, use the ETags for Complete, and use
+  paginated `ListParts` only to verify current provider state; receipt loss retransmits that exact
+  part safely.
+- Keep persistent sessions separate from expiring upload admission and completion-runner leases so
+  abandoned clients/workers cannot permanently consume their separate caps.
+- Accept completion as PostgreSQL work, return 202, then let a same-artifact runner complete directly
+  at the final key with `If-None-Match: *` and stream full SHA-256 before `AVAILABLE`.
 - Bound abandoned incomplete MPUs with same-workflow abort and provider stale-upload expiry; do not
   add temporary objects, final-object deletion, automatic repair, or general Blob GC.
 
 **Acceptance criteria**
 
 - A synthetic file above the M1 single-PUT limit uploads and pulls byte-identically.
-- Killing the CLI after arbitrary parts sends only absent/mismatched parts on rerun.
+- Killing the CLI after receipt-backed VERIFIED parts sends only unresolved parts on rerun; a part
+  whose UploadPart response was lost is safely retransmitted to obtain a receipt.
+- Create/resolve replay never rebinds a request; terminal attempts allocate the next generation.
+- Completion survives CLI/API disconnect, heartbeats through long verification, and fences stale
+  runners after takeover without an external queue.
 - Concurrent completion cannot overwrite a completed Blob and converges on one object.
 - Lost Complete responses and `NoSuchUpload` converge through the deterministic final key.
 - Ambiguous non-409 partial completion resumes only through the guarded same-MPU recovery edge;

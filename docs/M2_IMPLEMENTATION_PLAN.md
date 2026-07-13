@@ -5,11 +5,13 @@
 **Goal:** Add resumable multipart push for one Blob above 5,000,000,000 bytes while preserving every
 released M1 identity, publication, integrity, pull, and error invariant.
 
-**Architecture:** The API creates one provider MPU directly at the immutable final SHA-256 key,
-persists a deterministic part plan, reconciles ListParts, and issues a bounded rolling capability
-window. Conditional completion publishes at most one object; a streamed whole-object SHA-256 is
-mandatory before AVAILABLE. A separate expiring admission lease fences each active invocation while
-the persistent session/provider MPU remains resumable.
+**Architecture:** The API allocates generation-numbered provider attempts directly at the immutable
+final SHA-256 key, persists exact canonical part-plan bytes, reconciles stored UploadPart response
+receipts with ListParts, and issues a bounded rolling capability window. Completion is accepted as
+durable PostgreSQL work and executed by a same-artifact server runner under a separate completion
+lease. Conditional completion publishes at most one object; whole-object SHA-256 is mandatory before
+AVAILABLE. Expiring upload admission fences CLI mutations while the persistent session/MPU remains
+resumable.
 
 **Tech Stack:** Python 3.12, FastAPI, Typer, Pydantic v2, SQLAlchemy 2, Alembic, PostgreSQL 17,
 boto3/botocore, pinned MinIO, httpx, pytest, Hypothesis (add only if used for the state properties),
@@ -23,9 +25,16 @@ Ruff, and mypy.
   M1 single PUT, pull, Linux/macOS, metrics, and error envelope remain frozen.
 - Multipart activates only when `size_bytes > 5_000_000_000`.
 - Base part is 67,108,864 bytes; maximum part is 5,368,709,120 bytes; maximum 10,000 parts; maximum
-  Blob is 50,000,000,000,000 bytes.
+  Blob is 5,000,000,000,000 bytes.
 - Final Complete always carries `If-None-Match: *`; every new multipart final object is streamed and
   whole-file SHA-256 verified before AVAILABLE.
+- One immutable request UUID maps to one response/session; invocation UUID and Blob-scoped session
+  generation have distinct meanings. Terminal generations never reactivate.
+- UploadPart response ETags and normalized SHA-256 checksums are retained. ListParts verifies current
+  provider state but never supplies a missing completion receipt; receipt loss forces exact-part
+  re-upload. A supported provider must return the requested UploadPart checksum.
+- Completion returns 202, releases upload admission, and runs from PostgreSQL under a distinct
+  heartbeat/fencing lease. Do not add Kafka, Celery, or another queue.
 - Provider upload ID is never an independent stable API field; it may appear only inside a presigned
   capability URL whose entire query, along with absolute paths, provider bodies, and credentials,
   is redacted from logs/errors/telemetry and never interpreted by the client.
@@ -42,17 +51,18 @@ Ruff, and mypy.
 
 | File | Responsibility |
 | --- | --- |
-| `robolake/domain/multipart.py` | Pure part-size algorithm, frozen part values, state transitions. |
+| `robolake/domain/multipart.py` | Pure part-size algorithm, canonical plan encoder/hash, identities, state transitions. |
 | `robolake/domain/constants.py` | M2 protocol constants only. |
 | `robolake/domain/errors.py` | Stable M2 error classes/codes. |
 | `robolake/domain/records.py` | Framework-free session/part records. |
 | `robolake/application/contracts.py` | Part plans, status, capability window, invocation metrics. |
 | `robolake/application/ports.py` | Registry/provider/local transfer interfaces. |
-| `robolake/application/multipart.py` | Prepare, reconcile, issue, confirm, complete, abort use cases. |
+| `robolake/application/multipart.py` | Prepare, initiate, reconcile, issue, receipt confirm, accept-complete, abort use cases. |
+| `robolake/application/multipart_completion.py` | Claim, conditional Complete, reconcile, full verification, fenced completion state. |
 | `robolake/application/admission.py` | Acquire/renew fenced multipart admission leases. |
 | `robolake/application/push.py` | Select M1/M2 and orchestrate rolling-window resume. |
-| `robolake/infrastructure/models.py` | SQLAlchemy session/part mappings. |
-| `robolake/infrastructure/store.py` | Transactional session/part persistence and locks. |
+| `robolake/infrastructure/models.py` | SQLAlchemy request/session/part/upload-lease/completion-lease mappings. |
+| `robolake/infrastructure/store.py` | Transactional generation resolver, structural persistence, atomic lease fences/claims. |
 | `robolake/infrastructure/object_storage.py` | MPU control, paginated ListParts, exact presigning, conditional Complete, abort. |
 | `robolake/infrastructure/scanner.py` | One stable pass producing full and part hashes for large files. |
 | `robolake/infrastructure/http_transfer.py` | Positional bounded UploadPart streaming/outcome only. |
@@ -61,6 +71,8 @@ Ruff, and mypy.
 | `apps/api/schemas/transfers.py` | Strict multipart requests/responses. |
 | `apps/api/routes/transfers.py` | Thin session endpoints. |
 | `apps/api/errors.py` | Safe stable action mapping. |
+| `apps/completion_runner/main.py` | Same-artifact PostgreSQL completion loop; not a separate service boundary. |
+| `docker-compose.yml` | Run the same versioned artifact as API plus a supervised completion-runner process. |
 | `apps/cli/commands/datasets.py`, `apps/cli/main.py`, `apps/cli/output.py` | Existing push UX, progress, optional concurrency, narrow abort. |
 | `migrations/versions/<revision>_m2_multipart.py` | Additive schema, triggers, guarded downgrade. |
 | `config/minio/robolake-policy.template.json` | Existing MPU actions verified; no DeleteObject/final repair permission. |
@@ -80,7 +92,8 @@ Ruff, and mypy.
 
 **Interfaces:**
 - Produces: `plan_multipart(size_bytes: int) -> MultipartPlan`, `MultipartPart`,
-  `MultipartSessionState`, `UploadPartState`, and M2 domain errors.
+  `canonical_part_plan_bytes(plan: HashedMultipartPlan) -> bytes`, `MultipartSessionState`,
+  `UploadPartState`, typed request/invocation/session-generation IDs, and M2 domain errors.
 - Consumes: existing `Sha256Digest`, Blob/UploadSession records, and illegal-transition style.
 
 - [ ] **Step 1: Write formula and boundary tests**
@@ -93,8 +106,7 @@ Ruff, and mypy.
         (10 * 1024**3, 67_108_864, 160, 67_108_864),
         (100 * 1024**3, 67_108_864, 1_600, 67_108_864),
         (1024**4, 134_217_728, 8_192, 134_217_728),
-        (5 * 1024**4, 1_073_741_824, 5_120, 1_073_741_824),
-        (50_000_000_000_000, 5_368_709_120, 9_314, 1_211_965_440),
+        (5_000_000_000_000, 536_870_912, 9_314, 121_196_544),
     ],
 )
 def test_plan_multipart_boundaries(size: int, part_size: int, count: int, final_size: int) -> None:
@@ -110,6 +122,11 @@ def test_plan_multipart_boundaries(size: int, part_size: int, count: int, final_
 Run: `uv run pytest tests/unit/domain/test_multipart.py -q`
 
 Expected: collection fails because `robolake.domain.multipart` does not exist.
+
+Add golden-vector tests for the exact schema-v1 canonical JSON bytes/hash: fixed field order, compact
+UTF-8, no trailing newline, JSON integers only, ascending part number, lowercase digests. Mutate every
+field and reject alternate whitespace/order, duplicate/unknown fields, floats, booleans, and uppercase
+hex. The server hashes validated typed fields rather than caller serialization.
 
 - [ ] **Step 3: Implement exact pure values and formula**
 
@@ -127,7 +144,7 @@ class MultipartPlan:
     parts: Sequence[MultipartPart]
 
 def plan_multipart(size_bytes: int) -> MultipartPlan:
-    if not 5_000_000_000 < size_bytes <= 50_000_000_000_000:
+    if not 5_000_000_000 < size_bytes <= 5_000_000_000_000:
         raise UnsupportedFileSizeError("multipart", size_bytes)
     part_size = 67_108_864
     while math.ceil(size_bytes / part_size) > 10_000 and part_size < 5_368_709_120:
@@ -153,10 +170,12 @@ Place numeric values behind named constants. Add enum transition tables exactly 
 Assert `LOCAL_FILE_CHANGED`, `INVALID_PART_NUMBER`, `PART_SIZE_MISMATCH`,
 `PART_CHECKSUM_REJECTED`, `MULTIPART_SESSION_NOT_FOUND`, `ADMISSION_LEASE_HELD`,
 `ADMISSION_CAPACITY_EXHAUSTED`, `ADMISSION_LEASE_LOST`,
-`MULTIPART_COMPLETION_AMBIGUOUS`, and `FINAL_BLOB_PUBLICATION_CONFLICT`. Generate every enum pair
-and assert only documented edges succeed. Include guarded `COMPLETING -> IN_PROGRESS`; prove 409
-and `NoSuchUpload` with no final terminate the attempt. `UploadPartState` contains only `PENDING`,
-`UPLOADED`, and `VERIFIED`; capability issuance is not a state.
+`MULTIPART_INITIATION_IN_PROGRESS`, `MULTIPART_INITIATION_AMBIGUOUS`,
+`MULTIPART_COMPLETION_AMBIGUOUS`, and `FINAL_BLOB_PUBLICATION_CONFLICT`. Generate every enum pair and
+assert only documented edges succeed. Include `CREATED -> INITIATING -> IN_PROGRESS`,
+`CREATED -> CANCELLED`, terminal initiation ambiguity, and guarded `COMPLETING -> IN_PROGRESS`;
+prove 409/`NoSuchUpload` with no final terminate the generation. `UploadPartState` contains only
+`PENDING`, `UPLOADED`, and `VERIFIED`; capability issuance is not a state.
 
 - [ ] **Step 5: Run and commit**
 
@@ -178,24 +197,32 @@ git commit -m "feat(m2): define multipart protocol"
 - Test: `tests/integration/test_m2_migration.py`
 - Test: `tests/integration/test_m2_database_invariants.py`
 - Test: `tests/integration/test_m2_admission_leases.py`
+- Test: `tests/integration/test_m2_completion_leases.py`
 - Test: `tests/unit/infrastructure/test_store.py`
 
 **Interfaces:**
 - Consumes: domain session/part states and `MultipartPlan` from Task 1.
-- Produces: `UploadPartModel`, `MultipartAdmissionLeaseModel`, fenced repository operations,
-  plan reconciliation, and guarded offline migration/downgrade.
+- Produces: generation/request mappings, `UploadPartModel`, `MultipartAdmissionLeaseModel`,
+  `MultipartCompletionLeaseModel`, fenced repository operations, work claims, plan reconciliation,
+  and guarded offline migration/downgrade.
 
 - [ ] **Step 1: Write migration-from-M1 and direct-SQL failure tests**
 
 Start from revision `20260711_0002`, insert a valid M1 SINGLE_PUT row, upgrade, and assert it remains
-unchanged. Add SQL assertions that boundary mutation, part reparenting, VERIFIED without matching
-provider checksum, COMPLETING with a missing part, an unguarded COMPLETING regression, and COMPLETED
-without structurally consistent full-stream evidence all raise SQLSTATE `23514`. Prove different
-part numbers may share expected digest, provider checksum, and ETag while duplicate part number and
-overlapping ranges remain invalid.
+unchanged. Add SQL assertions for positive/unique Blob-scoped generations, immutable request
+bindings, exact canonical plan hash, initiation/provider-ID gates, boundary mutation after committed
+`CREATED` registration, part
+reparenting, VERIFIED without response+listing receipt agreement, COMPLETING with a missing part,
+unguarded recovery, invalid `PARTS_READY`/`FINAL_PRESENT` gates, and COMPLETED without structurally
+consistent full-stream evidence. Prove
+different part numbers may share expected digest/checksum/ETag while duplicate number and
+overlapping range remain invalid.
 
-Add lease tests for 64 abandoned/expired rows, atomic same-session takeover, monotonic epoch,
-current-owner renewal, stale-owner mutation rejection, and database-time expiry.
+Add upload lease tests for idempotent acquire request, invocation binding, 64 abandoned/expired rows,
+atomic same-session takeover, monotonic epoch, current-owner renewal, stale-owner atomic SQL
+rejection, and database-time expiry. Add completion-lease tests for one claim, separate capacity,
+independent heartbeat, stale runner rejection, and takeover after expiry. Direct structural SQL tests
+must not claim that PostgreSQL independently knows the caller identity.
 
 - [ ] **Step 2: Verify red state**
 
@@ -218,8 +245,13 @@ class UploadPartModel(Base):
     size_bytes: Mapped[int] = mapped_column(BigInteger)
     sha256: Mapped[str] = mapped_column(String(64))
     state: Mapped[str] = mapped_column(String(16))
-    provider_etag: Mapped[str | None] = mapped_column(Text)
-    provider_checksum_sha256: Mapped[str | None] = mapped_column(String(64))
+    upload_response_etag: Mapped[str | None] = mapped_column(Text)
+    upload_response_checksum_sha256: Mapped[str | None] = mapped_column(String(64))
+    upload_response_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    listed_etag: Mapped[str | None] = mapped_column(Text)
+    listed_checksum_sha256: Mapped[str | None] = mapped_column(String(64))
+    listed_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    provider_listed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_capability_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_capability_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     capability_issue_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -233,16 +265,28 @@ class MultipartAdmissionLeaseModel(Base):
     upload_session_id: Mapped[UUID] = mapped_column(
         ForeignKey("upload_sessions.id", ondelete="CASCADE"), primary_key=True
     )
+    invocation_id: Mapped[UUID] = mapped_column(Uuid)
     owner_id: Mapped[UUID] = mapped_column(Uuid)
+    epoch: Mapped[int] = mapped_column(BigInteger)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    renewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+class MultipartCompletionLeaseModel(Base):
+    __tablename__ = "multipart_completion_leases"
+    upload_session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("upload_sessions.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_instance_id: Mapped[UUID] = mapped_column(Uuid)
     epoch: Mapped[int] = mapped_column(BigInteger)
     acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     renewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 ```
 
-Add the immutable verification-evidence and same-MPU reconciliation fields defined in the migration
-design. `UploadPart.state` allows only PENDING, UPLOADED, and VERIFIED; capability metadata is
-diagnostic and does not advance state.
+Add session generation, plan schema/hash, initiation ambiguity, completion-work phase, immutable
+verification evidence, and same-MPU reconciliation fields from the migration design.
+`UploadPart.state` allows only PENDING, UPLOADED, VERIFIED; capability metadata is diagnostic only.
 
 - [ ] **Step 4: Implement transactional repository methods**
 
@@ -250,31 +294,37 @@ Define these exact interfaces:
 
 | Method | Signature |
 | --- | --- |
-| Create/resolve | `create_or_resolve_multipart(version_id: UUID, blob_id: UUID, plan: HashedMultipartPlan, idempotency_key: str) -> MultipartUploadContext` |
-| Acquire/renew lease | `acquire_multipart_lease(session_id: UUID, owner_id: UUID, ttl_seconds: int, capacity: int) -> AdmissionLease` |
-| Lock with fence | `lock_multipart_session(session_id: UUID, owner_id: UUID, epoch: int) -> MultipartUploadContext` |
+| Create/resolve | `create_or_resolve_multipart(request_id: UUID, version_id: UUID, blob_id: UUID, plan: HashedMultipartPlan) -> MultipartUploadContext` |
+| Acquire/renew upload lease | `acquire_multipart_lease(request_id: UUID, invocation_id: UUID, session_id: UUID, ttl_seconds: int, capacity: int) -> AdmissionLease` |
+| Fenced upload mutation | `mutate_multipart_session(session_id: UUID, owner_id: UUID, epoch: int, command: MultipartMutation) -> MultipartUploadContext` |
+| Begin initiation | `begin_provider_initiation(session_id: UUID, owner_id: UUID, epoch: int) -> None` |
 | Provider acknowledgement | `record_provider_upload(session_id: UUID, owner_id: UUID, epoch: int, provider_upload_id: str) -> None` |
 | Part reconciliation | `reconcile_parts(session_id: UUID, owner_id: UUID, epoch: int, provider_parts: Sequence[ProviderPart], attribution: PartAttribution) -> None` |
-| Guarded recovery | `recover_partial_completion(session_id: UUID, owner_id: UUID, epoch: int, evidence: PartialCompletionEvidence) -> None` |
-| State transition | `transition_multipart_session(session_id: UUID, owner_id: UUID, epoch: int, expected: MultipartSessionState, target: MultipartSessionState) -> None` |
+| Accept completion | `accept_completion(session_id: UUID, owner_id: UUID, epoch: int, request_id: UUID) -> AcceptedCompletion` |
+| Claim completion | `claim_completion(owner_instance_id: UUID, ttl_seconds: int, capacity: int) -> CompletionClaim | None` |
+| Heartbeat completion | `renew_completion_lease(session_id: UUID, owner_instance_id: UUID, epoch: int) -> None` |
+| Fenced completion write | `record_completion_observation(claim: CompletionClaim, observation: CompletionObservation) -> None` |
+| Guarded recovery | `recover_partial_completion(claim: CompletionClaim, evidence: PartialCompletionEvidence) -> None` |
 
-Use `SELECT ... FOR UPDATE`, retry the active-session uniqueness race by selecting the winner, and
-never persist counters derivable from rows. Lease acquisition uses one transaction-level advisory
-lock and PostgreSQL time; every mutation revalidates owner/epoch/expiry. A provider call happens
-outside the DB transaction and its result is fenced again before commit.
+Lock the Blob to allocate `max(generation)+1`; replay request bindings first and resolve uniqueness
+races by binding the winner. Never persist derivable counters. Upload lease acquisition uses an
+advisory lock and DB time; every application mutation is one atomic owner/epoch/expiry-fenced SQL
+statement. Completion claims use `FOR UPDATE SKIP LOCKED` or equivalent and a separate lease. All
+provider calls happen outside DB transactions; results are fenced again before commit.
 
 - [ ] **Step 5: Verify upgrade, constraints, downgrade guard, and M1 regression**
 
 Run:
 
 ```bash
-uv run pytest tests/integration/test_m2_migration.py tests/integration/test_m2_database_invariants.py tests/integration/test_m2_admission_leases.py tests/unit/infrastructure/test_store.py -q
+uv run pytest tests/integration/test_m2_migration.py tests/integration/test_m2_database_invariants.py tests/integration/test_m2_admission_leases.py tests/integration/test_m2_completion_leases.py tests/unit/infrastructure/test_store.py -q
 uv run pytest tests/integration/test_database_constraints.py -q
 ```
 
-Expected: all selected tests pass; 64 expired leases do not exhaust admission; downgrade refuses
-while multipart session/part/lease rows exist and succeeds only after terminal workflow evidence is
-archived/removed under the documented offline rollback.
+Expected: all selected tests pass; request/generation races converge; 64 expired upload leases do not
+exhaust admission; one completion claim/fence wins; downgrade refuses while multipart
+session/part/request/upload-lease/completion-lease rows exist and succeeds only after documented
+archive/removal.
 
 - [ ] **Step 6: Commit**
 
@@ -294,7 +344,8 @@ git commit -m "feat(m2): persist multipart sessions and parts"
 - Test: `tests/integration/test_m2_provider_contract.py`
 
 **Interfaces:**
-- Produces: `MultipartObjectStore` methods below and `ProviderPart`/`CompleteOutcome` contracts.
+- Produces: `MultipartObjectStore` methods below and distinct `UploadPartReceipt`,
+  `ListedProviderPart`, `CompletedPartReceipt`, and `CompleteOutcome` contracts.
 - Consumes: exact bucket/key/session/part inputs; never domain-manages provider error bodies.
 
 - [ ] **Step 1: Port the provider probes into failing integration tests**
@@ -306,14 +357,18 @@ response with an embedded `<Error>` element through the adapter and assert it re
 than `CompleteOutcome.CREATED`. Preserve the negative
 unguarded-overwrite proof as a probe test that never runs against non-ephemeral buckets.
 
+Assert the adapter captures ETag/checksum from UploadPart success independently of ListParts. Add a
+contract test proving Complete receives ordered stored response ETags. A matching ListParts-only ETag
+must not satisfy the Complete input contract. Document this as AWS-official but not live-AWS-tested.
+
 - [ ] **Step 2: Define the port**
 
 | Method | Exact signature |
 | --- | --- |
 | Initiate | `create_multipart(object_key: str) -> str` |
-| List | `list_parts(object_key: str, provider_upload_id: str) -> Sequence[ProviderPart]` |
+| List | `list_parts(object_key: str, provider_upload_id: str) -> Sequence[ListedProviderPart]` |
 | Presign | `presign_part(object_key: str, provider_upload_id: str, part_number: int, size_bytes: int, checksum_base64: str, expires_seconds: int) -> PresignedRequest` |
-| Complete | `complete_multipart(object_key: str, provider_upload_id: str, parts: Sequence[ProviderPart]) -> CompleteOutcome` |
+| Complete | `complete_multipart(object_key: str, provider_upload_id: str, parts: Sequence[CompletedPartReceipt]) -> CompleteOutcome` |
 | Abort | `abort_multipart(object_key: str, provider_upload_id: str) -> None` |
 
 `list_parts` must follow every `IsTruncated` marker. `complete_multipart` always passes
@@ -328,8 +383,9 @@ Expected: new tests fail because the port/adapter methods do not exist.
 
 - [ ] **Step 4: Implement minimal adapter and policy**
 
-Use `ChecksumAlgorithm="SHA256"` at initiation; sign exact part length/checksum; capture ETag only as
-opaque completion input; parse provider SHA-256 into canonical hex. Keep existing final prefix and
+Use `ChecksumAlgorithm="SHA256"` at initiation; sign exact part length/checksum; capture UploadPart
+response ETag/checksum as opaque completion receipt; parse listed provider SHA-256 separately into
+canonical hex. Keep existing final prefix and
 permissions. Confirm policy grants Create/Upload/Complete through `s3:PutObject`, ListParts, List MPU,
 and Abort, but does not add DeleteObject.
 
@@ -362,17 +418,21 @@ git commit -m "feat(m2): add multipart storage adapter"
 - Test: `tests/unit/application/test_transfers.py`
 
 **Interfaces:**
-- Produces: `MultipartTransferService.prepare`, `status`, `reconcile`, `issue_capabilities`, and
-  `confirm_part`, plus admission acquire/renew/takeover.
+- Produces: `MultipartTransferService.prepare`, `initiate`, `status`, `reconcile`,
+  `issue_capabilities`, and `confirm_part`, plus admission acquire/renew/takeover.
 - Consumes: repository from Task 2 and storage port from Task 3.
 
 - [ ] **Step 1: Write disagreement and lease tests**
 
-Use fakes where DB/provider parts differ. Assert provider matching parts become VERIFIED/reused,
-absence resets PENDING, mismatch schedules exact replacement, active session race resolves one row,
-and create-response loss leaves no guessed upload ID. Add the failure-matrix lease rows: 64 expired
-leases admit new work, one reacquisition winner increments epoch, stale owner mutation fails, and a
-late exact provider part is reconciled by the new owner.
+Use fakes where DB/provider parts differ. A receipt-backed provider match becomes VERIFIED/reused;
+a matching listed part without stored response receipt remains unresolved and is re-uploaded.
+Absence/mismatch schedules exact replacement. Prove immutable request replay, distinct invocation,
+one active generation under race, new generation only after terminal attempt, and no request
+rebinding. Exercise `CREATED -> INITIATING -> IN_PROGRESS`, cancellation without provider call,
+abort rejection while INITIATING, response-loss ambiguity, best-effort known-ID abort, and no guessed
+upload ID. After initiating-owner lease loss, a new owner must terminalize ambiguity rather than
+repeat Create in that generation. Add 64 expired upload leases, one reacquisition winner, stale mutation failure, and late
+exact provider write reconciliation.
 
 - [ ] **Step 2: Write rolling-window tests**
 
@@ -389,17 +449,20 @@ Also reject duplicate/out-of-plan/already-verified part numbers and any limit ou
 
 | Method | Exact signature |
 | --- | --- |
-| Prepare | `prepare(version_id: UUID, blob_sha256: Sha256Digest, part_checksums: Sequence[Sha256Digest], idempotency_key: str) -> MultipartPreparation` |
-| Acquire/renew | `acquire_lease(session_id: UUID, owner_id: UUID) -> AdmissionLease` |
+| Prepare | `prepare(request_id: UUID, version_id: UUID, blob_sha256: Sha256Digest, part_checksums: Sequence[Sha256Digest]) -> MultipartPreparation` |
+| Initiate | `initiate(session_id: UUID, owner_id: UUID, epoch: int) -> MultipartStatus` |
+| Acquire/renew | `acquire_lease(request_id: UUID, invocation_id: UUID, session_id: UUID) -> AdmissionLease` |
 | Reconcile | `reconcile(session_id: UUID, owner_id: UUID, epoch: int, phase: ReconciliationPhase) -> MultipartStatus` |
 | Issue | `issue_capabilities(session_id: UUID, owner_id: UUID, epoch: int, part_numbers: Sequence[int], limit: int) -> PartCapabilityWindow` |
 | Confirm | `confirm_part(session_id: UUID, owner_id: UUID, epoch: int, part_number: int, outcome: UploadPartOutcome) -> MultipartStatus` |
 
-Server recomputes the plan from Blob size and requires exactly one checksum per part. Prepare first
-returns an AVAILABLE Blob unchanged, then resolves/creates the active session. Confirm ignores any
-client ETag/checksum and calls provider reconciliation. Initial matches are attributed as reused;
-unambiguous current-invocation successes become newly transferred after verification; ambiguous or
-late/concurrent discoveries become reconciled. Capability issuance updates diagnostics only.
+Server recomputes canonical plan bytes/hash from Blob size and exactly one checksum per part. Prepare
+first returns an AVAILABLE Blob unchanged, replays immutable request mapping, then binds/creates the
+active generation. Initiate commits `INITIATING` before provider I/O and stores ID before
+`IN_PROGRESS`. Confirm accepts an untrusted UploadPart response receipt, stores it, then calls
+ListParts; only equality with current provider facts makes VERIFIED. A ListParts-only match forces
+re-upload. Initial receipt-backed matches are reused; unambiguous current responses are new;
+ambiguous/later discoveries are reconciled. Capability issuance updates diagnostics only.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -438,7 +501,9 @@ truncate, and same-metadata byte mutation on a resumed invocation all stop befor
 
 Use a recording transport with four barriers. Assert no more than concurrency requests/buffers are
 active, each request reads exactly its positional range in 1 MiB chunks, a failing worker stops new
-scheduling, in-flight workers settle, and the complete window is reconciled.
+scheduling, in-flight workers settle, and the complete window is reconciled. Capture the successful
+UploadPart response ETag/checksum as an opaque `UploadPartOutcome`; simulate response loss and prove
+the API cannot fabricate that receipt from the later listing.
 
 - [ ] **Step 3: Implement pure streaming contracts**
 
@@ -464,8 +529,8 @@ whole-file SHA-256 pass and require the sealed digest before calling Complete.
 
 - [ ] **Step 4: Extend Push selection without changing M1**
 
-For each unique Blob: use the existing M1 workflow at `<= 5_000_000_000`; otherwise run prepare,
-acquire/renew the admission lease, reconcile, run rolling upload, and confirm with the current
+For each unique Blob: use existing M1 at `<= 5_000_000_000`; otherwise prepare, acquire/renew upload
+admission, initiate a CREATED generation under that fence, reconcile, run rolling upload, and confirm with the current
 fencing epoch. Keep Dataset registration before transfer but ensure the large-file plan is fully
 validated before provider session mutation. Lease loss stops new scheduling and DB mutation;
 already-started exact part PUTs settle and are reconciled by the next owner.
@@ -486,77 +551,101 @@ git add robolake/infrastructure robolake/application tests
 git commit -m "feat(m2): stream bounded resumable parts"
 ```
 
-### Task 6: Implement conditional completion and whole-byte publication verification
+### Task 6: Implement asynchronous conditional completion and whole-byte verification
 
 **Files:**
 - Modify: `robolake/application/multipart.py`
+- Create: `robolake/application/multipart_completion.py`
 - Modify: `robolake/infrastructure/store.py`
 - Modify: `robolake/infrastructure/object_storage.py`
+- Modify: `robolake/infrastructure/settings.py`
+- Create: `apps/completion_runner/main.py`
+- Modify: `docker-compose.yml`
 - Test: `tests/unit/application/test_multipart_completion.py`
 - Test: `tests/integration/test_m2_completion.py`
 - Test: `tests/integration/test_m2_concurrency.py`
+- Test: `tests/integration/test_m2_completion_runner.py`
 
 **Interfaces:**
-- Produces: `complete(session_id, owner_id, epoch, idempotency_key) -> MultipartPreparation` and the
-  only M2 path to `Blob AVAILABLE`.
-- Consumes: reconciled provider parts, conditional completion outcomes, streamed `iter_bytes`.
+- Produces: `accept_completion(...) -> AcceptedCompletion`, a bounded PostgreSQL completion runner,
+  and the only M2 path to `Blob AVAILABLE`.
+- Consumes: receipt-backed parts, completion claims/leases, conditional outcomes, streamed
+  `iter_bytes`.
 
 - [ ] **Step 1: Write rows 5–13 and 17–18 as failing tests**
 
-Cover provider-success/API-loss, provider-response loss, embedded error inside HTTP 200, repeated
-Complete, matching/mismatching final, two sessions, one publisher while another uploads, and 412.
+Cover 202 response/API-loss, client disconnect, provider-response loss, embedded error inside HTTP
+200, repeated Complete, matching/mismatching final, two provider attempts, and 412.
 Explicitly test all four recovery cases: matching final; final absent with same MPU/all parts;
 final absent with same MPU/valid subset taking guarded COMPLETING regression; and 409 or
-`NoSuchUpload` with no final creating a new all-PENDING session/ID. Inject a final object whose
+`NoSuchUpload` with no final requiring a new request, generation, all-PENDING plan, and ID. Inject a final object whose
 composite checksum matches the part plan but whole SHA differs; assert it never becomes AVAILABLE.
-Expire/take over the lease around the provider call and prove a stale result cannot commit.
+Also make a `FINAL_PRESENT` object disappear before the read and prove same-MPU requeue or terminal
+new-generation handling without Complete under the stale adoption reason.
+Prove receipt validation requires both UploadPart response ETag and SHA-256 checksum, and Complete
+receives stored response ETags, never ListParts-only ETags. Hold provider
+Complete and full GET longer than API/upload lease limits while independent completion heartbeats
+keep ownership. Kill a runner, expire/take over its completion lease, restart full verification at
+byte zero, and prove stale evidence/AVAILABLE/terminal writes cannot commit. Two runners racing must
+claim one row once.
 
 - [ ] **Step 2: Verify red state**
 
-Run: `uv run pytest tests/unit/application/test_multipart_completion.py tests/integration/test_m2_completion.py tests/integration/test_m2_concurrency.py -q`
+Run: `uv run pytest tests/unit/application/test_multipart_completion.py tests/integration/test_m2_completion.py tests/integration/test_m2_concurrency.py tests/integration/test_m2_completion_runner.py -q`
 
-Expected: failures show no COMPLETING/final verification orchestration exists.
+Expected: failures show no durable acceptance/runner/completion-lease orchestration exists.
 
 - [ ] **Step 3: Implement completion decision order**
 
 ```python
-def complete(
-    self, session_id: UUID, owner_id: UUID, epoch: int, idempotency_key: str
-) -> MultipartPreparation:
-    context = self.registry.lock_multipart_session(session_id, owner_id, epoch)
-    if context.blob.state is BlobState.AVAILABLE:
-        return self._available(context)
-    self._reconcile_all(context)
-    self._require_all_verified(context)
-    self.registry.mark_completing(context.session.id, owner_id, epoch)
-    outcome = self.objects.complete_multipart(
-        context.blob.object_key, context.session.provider_upload_id, context.provider_parts
+def accept_completion(
+    self, session_id: UUID, owner_id: UUID, epoch: int, request_id: UUID
+) -> AcceptedCompletion:
+    reason = self._resolve_final_present_or_require_all_parts(session_id, owner_id, epoch)
+    return self.registry.accept_completion_and_release_upload_lease(
+        session_id, owner_id, epoch, request_id, reason
     )
-    return self._reconcile_final(context, owner_id, epoch, outcome)
+
+def run_one_completion(self, owner_instance_id: UUID) -> bool:
+    claim = self.registry.claim_completion(owner_instance_id)
+    if claim is None:
+        return False
+    self._reconcile_final_or_complete(claim)
+    return True
 ```
 
-`_reconcile_final` checks AVAILABLE, HEAD/size, streams `iter_bytes` into SHA-256, and only then
-records immutable `FULL_STREAM_SHA256` observed digest/size/read bytes/time/verifier and commits Blob
-AVAILABLE + session COMPLETED under a revalidated fence. PostgreSQL checks evidence structure but
-the integration test proves the actual provider read. On partial same-MPU non-409 outcome, take only
-the guarded recovery edge. On 409 or `NoSuchUpload` with absent final, terminate the attempt,
-release the lease, and create a new MPU/session with no adopted receipts. On 412, verify the existing
-final before success. On mismatch, record the stable cause and never call delete/put/complete again.
+Acceptance atomically records `COMPLETING`/`PENDING_CLAIM`, releases upload admission, and yields HTTP
+202. The runner uses the same versioned artifact and PostgreSQL rows as its durable work registry;
+do not introduce an external queue. Claim with `FOR UPDATE SKIP LOCKED` or equivalent, enforce
+separate completion concurrency, and heartbeat in short independent transactions at most TTL/3.
+
+`_reconcile_final_or_complete` checks AVAILABLE/final key first. It calls Complete only for
+`PARTS_READY`, supplying ordered stored UploadPart response ETags and `If-None-Match: *`;
+`FINAL_PRESENT` never pretends incomplete parts are resolved. If that final observation disappears,
+reconcile and requeue safely; a later Complete requires new `PARTS_READY` acceptance. It streams `iter_bytes` into SHA-256
+and only then records immutable `FULL_STREAM_SHA256` evidence and commits AVAILABLE+COMPLETED under
+the current completion fence. PostgreSQL checks evidence structure; integration tests prove the real
+read. On partial same-MPU non-409, take only the guarded recovery edge and release completion
+ownership so a CLI can reacquire upload admission. On 409/`NoSuchUpload` with absent final, terminate
+the generation; a later new request creates generation+1 with no adopted receipts. On 412, verify the
+existing final. On mismatch, stop without delete/overwrite.
 
 - [ ] **Step 4: Add explicit proof that final verification reads every byte once**
 
-The fake iterator records offsets/chunks; the live test corrupts one byte and asserts exit path 5.
-Assert an already AVAILABLE Blob performs zero provider reads and a new multipart Blob performs one
-complete read.
+The fake iterator records offsets/chunks; live test corrupts one byte and asserts exit path 5. Assert
+an AVAILABLE Blob performs zero provider reads and a new multipart Blob performs one full read.
+Interrupted verification plus takeover performs a second read from byte zero; it never resumes by
+Range or persists live byte progress.
 
 - [ ] **Step 5: Verify and commit**
 
-Run: `uv run pytest tests/unit/application/test_multipart_completion.py tests/integration/test_m2_completion.py tests/integration/test_m2_concurrency.py -q`
+Run: `uv run pytest tests/unit/application/test_multipart_completion.py tests/integration/test_m2_completion.py tests/integration/test_m2_concurrency.py tests/integration/test_m2_completion_runner.py -q`
 
-Expected: conditional races converge; no mismatch is deleted/overwritten; loss/replay is idempotent.
+Expected: 202 work survives disconnect; long completion stays leased; takeover fences stale runners;
+conditional races converge; no mismatch is deleted/overwritten; loss/replay is idempotent.
 
 ```bash
-git add robolake/application robolake/infrastructure tests
+git add robolake/application robolake/infrastructure apps/completion_runner docker-compose.yml tests
 git commit -m "feat(m2): publish multipart blobs create-only"
 ```
 
@@ -583,10 +672,11 @@ git commit -m "feat(m2): publish multipart blobs create-only"
 
 - [ ] **Step 1: Write API contract and redaction tests**
 
-Assert strict unknown-field rejection, max window 16, no independent provider-upload-ID response
-field, no client ETag on confirm/complete, stable codes/actions including `ADMISSION_LEASE_LOST`,
-and query-canary absence from TestClient/CLI captured logs. Assert every mutating route requires the
-current owner/epoch and the client treats each capability URL as opaque.
+Assert strict unknown-field rejection, UUID request/invocation fields, max window 16, no independent
+provider-upload-ID field, UploadPart response receipt accepted only by confirm (never complete),
+stable initiation/admission errors, and query-canary absence from logs. Assert upload mutations carry
+owner/epoch, status requires no lease, Complete returns replayable 202, and the client treats each
+capability URL as opaque.
 
 - [ ] **Step 2: Implement strict schemas and routes**
 
@@ -610,16 +700,21 @@ class AdmissionLeaseResponse(StrictSchema):
 
 class MultipartStatusResponse(StrictSchema):
     session_id: UUID
+    session_generation: int
     state: str
+    completion_reason: str | None
+    completion_phase: str | None
     planned_part_count: int
     resolved_part_count: int
     resolved_part_bytes: int
     parts: Sequence[MultipartPartStatusResponse]
 ```
 
-The public status may paginate part details while totals remain derived. The API endpoint never
-returns the provider upload ID. Lease owner/epoch are fencing coordinates, not secrets or
-authorization; the CLI renews them on the configured heartbeat and stops mutations after loss.
+Add required `ConfirmPartRequest` fields for opaque `upload_response_etag` and the requested response
+checksum; these are validated against provider listing before progress. Public status may paginate part
+details while totals remain derived. It never returns provider upload ID or completion lease
+coordinates. Upload lease owner/epoch are fencing values, not authorization; CLI renews them during
+upload and holds none while polling `COMPLETING`.
 
 - [ ] **Step 3: Implement CLI behavior and metrics**
 
@@ -627,13 +722,17 @@ Keep `robolake push SOURCE --dataset NAME`; add `--part-concurrency` defaulting 
 validated `1..16`. Render `newly_transferred_part_bytes`, `reused_provider_part_bytes`,
 `reconciled_part_bytes`, `completed_object_bytes`, `verification_read_bytes`, and
 `whole_object_verification_duration` separately, never as “wire bytes.” Enforce the count/byte sum
-invariants. Add `robolake upload abort SESSION_UUID`; Ctrl-C never invokes it.
+invariants. After 202, poll short status requests; Ctrl-C stops waiting but does not cancel server
+completion. A rerun seeing `COMPLETING` resumes polling. Add `robolake upload abort SESSION_UUID`;
+Ctrl-C never invokes it.
 
 - [ ] **Step 4: Implement abort disagreement rows 15–16**
 
-Under the current lease fence, commit ABORTING before provider call, wait for worker cancellation at
-the CLI, retry abort as needed, and mark ABORTED only after `NoSuchUpload`. If final appears, run
-final verification instead. A stale lease owner cannot initiate or record abort.
+`CREATED` cancel becomes terminal `CANCELLED` without provider I/O. `INITIATING` abort returns
+`MULTIPART_INITIATION_IN_PROGRESS`. With a durable upload ID and current upload fence, commit
+ABORTING, wait for CLI workers, retry provider abort, and mark ABORTED only after absence. If final
+appears, transition to COMPLETING, release upload lease, and queue runner reconciliation instead. A
+stale owner cannot initiate/record abort.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -644,7 +743,8 @@ uv run pytest tests/unit/api/test_m2_transfers.py tests/unit/cli/test_m2_command
 uv run robolake --help
 ```
 
-Expected: exact API/CLI contracts pass; help describes file-level multipart resume and safe abort.
+Expected: exact API/CLI contracts pass; help describes part-level upload resume, async completion
+polling, and safe cancel/abort.
 
 ```bash
 git add apps robolake/infrastructure tests
@@ -672,17 +772,19 @@ git commit -m "feat(m2): expose multipart push and abort"
 - [ ] **Step 1: Add the small CI tracer test**
 
 Inject a low test-only selection threshold while retaining provider-valid 6 MiB non-final parts.
-Push, interrupt after known part numbers, rerun, assert those provider parts receive no second PUT,
+Push, interrupt after receipt-backed VERIFIED part numbers, rerun, assert those parts receive no second PUT,
 allow the first admission lease to expire/reacquire, reach READY, pull through unchanged M1 flow,
-and compare bytes.
+and compare bytes. Also stop the waiting CLI after 202, prove the completion runner continues, and
+poll to the same READY result.
 
 - [ ] **Step 2: Add the manual profile with resource preflight**
 
 The script refuses unless free disk is at least 20 GB and records machine/containers/commit. It
 stream-generates 5,000,000,001 deterministic bytes, kills the CLI after selected parts, resumes,
-checks part metrics, pulls, runs full SHA-256 and `cmp`, records wall/RSS, and scans logs for secret
-canaries. It reports newly-transferred, reused, and reconciled part payload separately. It is never
-selected by default pytest/CI.
+checks part metrics, stops/restarts the polling CLI after 202 without stopping the server runner,
+pulls, runs full SHA-256 and `cmp`, records wall/RSS, and scans logs for secret canaries. It reports
+newly-transferred, reused, reconciled, and verification reads separately. It is never selected by
+default pytest/CI.
 
 - [ ] **Step 3: Run all quality gates**
 
@@ -730,8 +832,14 @@ git commit -m "docs(m2): add multipart evidence and guidance"
 ## Self-review checklist
 
 - Every mandatory provider/failure-matrix row maps to a focused test above.
-- Persistent session state and expiring admission/fencing state remain separate in every interface.
+- Request, invocation, Blob-scoped generation, upload lease, and completion lease remain distinct in
+  every interface; request/session identities are never rebound/reactivated.
+- `CREATED`/`INITIATING` makes provider creation ambiguity explicit; abort never guesses an upload ID.
 - `UploadPart` has no ISSUED state; capability metadata never advances progress.
+- Complete uses retained UploadPart response ETags; ListParts-only observations never manufacture a
+  receipt and response loss triggers safe exact-part retransmission.
+- Completion is 202/durable/server-owned, releases upload admission, uses PostgreSQL rather than an
+  external queue, heartbeats long I/O, and fences stale runner commits.
 - 409/NoSuchUpload full restart cannot adopt any old provider part; guarded same-MPU recovery is
   limited to the documented non-409 partial case.
 - Newly transferred, reused, and reconciled invocation metrics are disjoint and never claim wire
@@ -739,8 +847,9 @@ git commit -m "docs(m2): add multipart evidence and guidance"
 - Offline rollout/rollback never runs v0.1.0 beside active M2 rows and never removes final Blobs.
 - Plan contains no temporary-object path, production byte proxy, pull change, final delete, repair,
   general GC, authentication, or excluded technology.
-- All signatures use `MultipartSessionState`, `HashedMultipartPlan`, `ProviderPart`, and
-  `PartCapabilityWindow` consistently.
+- Exact schema-v1 canonical part-plan bytes/hash have golden vectors and mutation tests.
+- All signatures distinguish `UploadPartReceipt`, `ListedProviderPart`, `CompletedPartReceipt`,
+  `HashedMultipartPlan`, and `PartCapabilityWindow` consistently.
 - Implementation may split large modules after a review gate, but must preserve the listed public
   interfaces and import boundaries.
 - No task proceeds to the next review gate with red tests, hidden warnings, or undocumented provider

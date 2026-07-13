@@ -21,13 +21,31 @@ Provider probes showed:
 
 ## Decision
 
-Upload multipart directly to the deterministic final Blob key. Only the API submits completion, with
-`If-None-Match: *` and its provider-reconciled ordered part receipts. A 200, 412, 409, timeout, or
+Upload multipart directly to the deterministic final Blob key. The complete endpoint never holds a
+control request open for provider completion or final verification. It validates the current upload
+fence and accepts either `PARTS_READY` (every response receipt is provider-verified) or
+`FINAL_PRESENT` (a fresh deterministic-key observation needs adoption verification). It atomically
+records `COMPLETING`, releases that lease, and returns HTTP 202. PostgreSQL `COMPLETING` rows are the
+durable work registry. `FINAL_PRESENT` never marks incomplete parts VERIFIED or calls Complete with
+an incomplete receipt set.
+
+A bounded server runner from the same modular-monolith artifact claims work through PostgreSQL
+`FOR UPDATE SKIP LOCKED` or equivalent, under a separate completion owner UUID, monotonic epoch, and
+expiring lease. Default concurrency is 2 (hard maximum 8), with 120-second TTL and 30-second
+heartbeat. It submits
+`CompleteMultipartUpload(If-None-Match: *)` using the ordered ETags captured from successful
+UploadPart responses, then performs deterministic-key reconciliation and full verification. Its
+heartbeat runs in independent short transactions throughout the long provider calls. No Kafka,
+Celery, external queue, or long database transaction is introduced. A 200, 412, 409, timeout, or
 lost response is not sufficient to mark success.
 
-ETags are opaque ordered completion receipts, not identifiers. Different part numbers may have
+ETags are opaque ordered completion receipts, not identifiers or integrity proof. Different part numbers may have
 identical ETags, provider checksums, and expected SHA-256 values when their bytes are identical;
-completion requires one matching receipt per expected part number but never receipt uniqueness.
+completion requires one stored UploadPart response receipt per expected part number but never receipt
+uniqueness. ListParts verifies that the current provider part matches the stored response
+ETag/checksum receipt, size, and checksum; it is not the source of the Complete receipt list.
+Supported providers must return the requested SHA-256 in the UploadPart response. If the response
+was lost, RoboLake re-uploads that exact part and records the replacement response before completion.
 
 HTTP status 200 alone is never completion proof: CompleteMultipartUpload can embed an error after
 sending initial 200 headers. The SDK/provider adapter must parse and surface the final body outcome;
@@ -44,6 +62,12 @@ verification-read bytes, completion time, and verifier implementation. PostgreSQ
 these values structurally equal Blob identity; it cannot independently prove the external GET or
 hash computation occurred. Provider integration tests supply that proof.
 
+Every completion-state write includes the current completion owner and epoch. Lease renewal failure
+or takeover fences the stale runner from committing `COMPLETED`, `FAILED`, verification evidence, or
+Blob `AVAILABLE`. Provider Complete may already have settled, so the next owner checks the final key
+first and safely repeats a full verification read when required. CLI status polling is independent
+of that work; Ctrl-C stops local waiting but never aborts server-owned completion.
+
 This supersedes only ADR 0004's prospective M2 claim that a provider system full-object SHA-256 is
 normally available for multipart. The pinned provider exposes only a composite SHA-256, so M2
 full-byte verification is mandatory rather than a missing-checksum fallback. ADR 0004's historical
@@ -59,12 +83,16 @@ client part plan from becoming an AVAILABLE attestation.
 ## Consequences
 
 - Final publication costs one additional full provider read for every new multipart Blob.
+- Worker failure during that read may cause a full reread; Range verification resume is not M2.
+- Completion is eventually processed by a PostgreSQL-claimed runner and does not inherit the CLI
+  control-request timeout or upload admission-lease lifetime.
 - Metrics expose completed-object bytes, verification-read bytes, and whole-object verification
   duration separately from new/reused part payload bytes; none claim exact wire traffic.
 - A buggy/malicious trusted caller can still cause wrong bytes to occupy a non-AVAILABLE final key
   before detection; ADR 0007's detect/report/stop boundary applies.
 - There is no temporary namespace, temporary-object deletion, or second copy state.
-- A losing incomplete MPU is explicitly aborted; unknown MPUs rely on stale-provider cleanup.
+- A known losing incomplete MPU is best-effort aborted before terminal adoption; failed/unknown
+  cleanup relies on stale-provider lifecycle and never blocks a matching AVAILABLE attestation.
 - M1 create-only keys, AVAILABLE meaning, READY meaning, and no-overwrite/no-delete rules remain
   unchanged.
 

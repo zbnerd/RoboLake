@@ -14,19 +14,32 @@ multi-gigabyte artifacts. The >5,000,000,000-byte demonstration is manual/schedu
 
 ### Domain and application
 
-- part-size formula and exact boundaries for 5,000,000,001 B, 10 GiB, 100 GiB, 1 TiB, 5 TiB,
-  50,000,000,000,000 B, exact multiples, and a one-byte final part;
+- part-size formula and exact boundaries for 5,000,000,001 B, 10 GiB, 100 GiB, 1 TiB,
+  5,000,000,000,000 B, exact multiples, and a one-byte final part; reject one byte above the
+  portable maximum;
+- schema-v1 canonical part-plan golden bytes/hash, stable field/part ordering, and rejection of
+  whitespace, trailing newline, floats, booleans, duplicate/unknown fields, uppercase digest, and
+  mutation of every identity field;
 - reject zero/negative/over-maximum size, more than 10,000 parts, nonconsecutive numbers, overlapping
   ranges, wrong final size, and client-selected part size;
 - stable full/part hashing with source identity before/after; inode/size/mtime and invisible-byte
   mutation scenarios;
-- all legal/illegal session and part transitions;
+- immutable `request_id` replay, distinct `invocation_id`, monotonic Blob-scoped generation, and
+  concurrent resolver convergence;
+- all legal/illegal session and part transitions, including `CREATED -> INITIATING -> IN_PROGRESS`,
+  `CREATED -> CANCELLED`, and terminal initiation ambiguity;
 - stable error code, action, and CLI exit mapping;
-- capability issuance diagnostics and client-reported `UPLOADED` never advance progress; only
-  provider-reconciled VERIFIED parts do;
+- capability issuance never advances progress; response-receipt-backed and ListParts-matching
+  `VERIFIED` parts do;
+- a ListParts match without a complete stored UploadPart response ETag/checksum is re-uploaded and
+  never supplied directly to Complete;
 - `COMPLETING -> IN_PROGRESS` succeeds only for final-absent, non-409, same-MPU structurally valid
   partial reconciliation;
 - 409/`NoSuchUpload` with no final terminates the old attempt and creates a new all-PENDING plan;
+- completion acceptance returns 202, releases upload admission, and remains durable across client
+  disconnect; a same-artifact runner owns provider Complete/full verification;
+- completion lease heartbeat/takeover fences stale runner results and restarts interrupted full
+  verification from byte zero;
 - metrics keep logical/unique/invocation/part/wire meanings separate, including
   disjoint newly-transferred/reused/reconciled attribution, `completed_object_bytes`,
   `verification_read_bytes`, and
@@ -36,20 +49,31 @@ multi-gigabyte artifacts. The >5,000,000,000-byte demonstration is manual/schedu
 ### PostgreSQL integration
 
 - migration from v0.1.0 schema with existing M1 rows and downgrade preflight;
-- one active session per Blob under concurrent inserts;
-- frozen strategy, Blob link, provider ID, part size/count/offset/size/hash after `IN_PROGRESS`;
+- one active generation per Blob under concurrent inserts plus unique positive
+  `(blob_id, session_generation)`;
+- immutable M2 request bindings never rebind, same acquire request replays one lease result, and a
+  terminal generation requires a new request/new generation;
+- frozen strategy, Blob link, generation, provider ID, and part size/count/offset/size/hash from
+  committed `CREATED` registration;
 - part cannot attach to another session or duplicate number/offset;
 - different part numbers may carry identical bytes, expected digests, provider checksums, and ETags;
 - duplicate part number and overlapping/gapped ranges remain invalid;
-- `VERIFIED` requires provider receipt/checksum equality;
-- `COMPLETING` requires all planned parts verified;
-- guarded `COMPLETING -> IN_PROGRESS` requires the recorded same-MPU partial-reconciliation facts;
+- `VERIFIED` requires stored response ETag/checksum plus equal listed ETag/checksum and listed size;
+- `COMPLETING/PARTS_READY` requires all planned parts receipt-backed/verified; `FINAL_PRESENT`
+  requires a fresh final-key observation and may not falsify incomplete part state;
+- guarded `COMPLETING -> IN_PROGRESS` requires recorded same-MPU reconciliation facts, including the
+  special vanished-`FINAL_PRESENT` requeue contract;
 - `COMPLETED` requires Blob AVAILABLE and structurally consistent immutable verification method,
   digest, size, read bytes, completion time, and verifier version;
 - PostgreSQL structural evidence tests are separate from provider whole-stream integration proof;
 - 64 expired admission leases consume zero active slots;
 - concurrent lease takeover yields one owner and monotonically increasing epoch;
 - stale owner/epoch cannot mutate session/parts, issue capabilities, complete, or abort;
+- repository fenced SQL rejects stale upload ownership while direct structural SQL tests do not
+  falsely claim to prove caller identity;
+- completion work claim uses one runner/epoch; long provider/full-GET work heartbeats independently;
+- completion takeover after runner death rejects stale evidence/AVAILABLE/terminal writes;
+- upload and completion capacity are separate, and completion does not retain an upload lease;
 - terminal sessions cannot mutate;
 - direct SQL cannot mutate AVAILABLE Blob/READY Version or invent a mismatching target; and
 - no mutable progress counter exists to drift after a crash.
@@ -59,38 +83,47 @@ multi-gigabyte artifacts. The >5,000,000,000-byte demonstration is manual/schedu
 Each test creates isolated keys and aborts/deletes only its own synthetic state:
 
 1. normal multipart upload and full-object verification;
-2. interruption after a subset and resume without retransmitting matching parts;
+2. interruption after a receipt-backed VERIFIED subset and resume without retransmitting those parts;
 3. exact duplicate part replay;
 4. different same-number part replacement before completion;
 5. two distinct part numbers containing identical bytes expose valid identical ETag/checksum values
    and do not block completion;
 6. wrong SHA-256 and signed-length rejection;
 7. paginated ListParts reconciliation (fake page size plus live provider smoke);
-8. lost UploadPart API response with provider part present and reconciled metric attribution;
+8. lost UploadPart response with provider part present forces exact re-upload, obtains a new response
+   ETag/checksum, and retains reconciled metric attribution;
 9. lost Complete response through a faulting transport/proxy;
 10. HTTP 200 with an embedded Complete error is surfaced by the adapter and never marks the session
    COMPLETED or Blob AVAILABLE;
-11. all-parts-present `COMPLETING` retry remains `COMPLETING` and replays conditional Complete;
+11. all-parts-present receipt-backed `COMPLETING` retry remains `COMPLETING` and replays conditional
+    Complete using stored response ETags, never ListParts-only values;
 12. partial same-MPU `COMPLETING` recovery takes the guarded transition and uploads only unresolved
     parts;
 13. Abort followed by `NoSuchUpload`;
-14. provider-side `NoSuchUpload` with no final creates a new session/ID with every part unresolved;
-15. 409 with absent final creates a new session/ID and uploads every part again;
+14. provider-side `NoSuchUpload` with no final requires a new request/generation/ID with every part unresolved;
+15. 409 with absent final requires a new request/generation/ID and uploads every part again;
 16. concurrent same-Blob session creation and provider MPU races;
 17. unguarded Complete demonstrably overwrites in a probe-only negative test;
 18. conditional final completion yields exactly one winner;
-19. matching final key is adopted only after full-byte verification;
+19. matching final key is adopted only after full-byte verification; a `FINAL_PRESENT` adoption with
+    incomplete session parts never marks those parts resolved, and disappearance before verification
+    safely requeues or terminalizes according to provider facts;
 20. mismatching final key is never overwritten or deleted;
-21. incomplete loser is explicitly aborted after matching final adoption;
+21. known incomplete loser receives best-effort abort after matching final adoption; abort failure
+    does not delete/overwrite final state and remains bounded by provider lifecycle;
 22. a part URL used after lease loss may write only exact bytes and is reconciled by the new owner;
-23. provider checksum/composite checksum is not accepted as whole Blob SHA-256; and
+23. a missing UploadPart response checksum fails the provider contract, and multipart composite
+    checksum is not accepted as whole Blob SHA-256;
 24. capability URLs/query canaries, independently exposed provider upload IDs, credentials, and
-    absolute paths are absent from logs.
+    absolute paths are absent from logs; and
+25. initiation response loss leaves no guessed/adopted provider ID and any known in-memory ID is
+    best-effort aborted without claiming success.
 
 ### API and CLI
 
 - same push chooses M1 single PUT below/equal threshold and M2 above it;
-- create/resolve, status, reconcile, rolling-window issue, confirm, complete, and permitted abort;
+- create/resolve replay and generation allocation; fenced provider initiation; status, reconcile,
+  rolling-window issue, receipt confirm, asynchronous complete, and permitted cancel/abort;
 - capability response never exceeds concurrency/hard maximum;
 - lease acquisition/renewal/reacquisition uses DB time and a monotonic epoch;
 - 64 abandoned invocations cease consuming admission capacity after lease expiry;
@@ -98,6 +131,12 @@ Each test creates isolated keys and aborts/deletes only its own synthetic state:
   admission errors;
 - stale lease-owner confirm/reconcile/complete/abort is rejected with
   `ADMISSION_LEASE_LOST`/`RETRY_PUSH`;
+- `CREATED` cancellation performs no provider call; abort during `INITIATING` returns
+  `MULTIPART_INITIATION_IN_PROGRESS`; ambiguous initiation returns the stable ambiguity error and
+  requires a new request/generation; an expired owner cannot repeat Create in the same generation;
+- complete returns 202, releases the upload lease, and CLI polling/disconnect cannot cancel work;
+- two completion runners claim once, heartbeat through a synthetic duration beyond API/upload lease
+  limits, fence stale commits, and safely take over after expiry;
 - client never advances more than the window and stops scheduling after one failure;
 - Ctrl-C leaves the session resumable rather than aborting it;
 - resume reports reused, newly transferred, and reconciled parts as disjoint categories;
@@ -147,7 +186,8 @@ Procedure:
 5. forcibly terminate the CLI process without calling abort;
 6. record provider ListParts and database status;
 7. rerun the identical push and prove earlier part numbers were reused, not retransmitted;
-8. complete conditional publication, full-byte verification, and Version finalization;
+8. accept asynchronous completion, stop the waiting CLI once, prove the server runner continues,
+   then poll through conditional publication, full-byte verification, and Version finalization;
 9. pull through the unchanged sequential M1 contract;
 10. compare source/restored size and SHA-256 (and `cmp` where practical);
 11. scan captured logs for presigned/capability query parameters and credentials; and
@@ -159,8 +199,9 @@ Procedure:
 Invocation metrics do not claim wire bytes. If retries partially transmitted bodies, only external
 network telemetry may report that traffic.
 
-Failure of checksum, create-only final publication, resume, byte equality, bounded memory, or secret
-redaction is a release blocker. Lack of resources to run the profile is reported, not fabricated.
+Failure of checksum, create-only final publication, resume, completion continuity after client
+disconnect, byte equality, bounded memory, or secret redaction is a release blocker. Lack of
+resources to run the profile is reported, not fabricated.
 
 ## Level 3: property and state-machine tests
 
@@ -169,14 +210,18 @@ Use generated Blob sizes and event sequences:
 - every accepted plan covers `[0, S)` exactly once, uses `1..N`, and satisfies part limits;
 - reconstructing generated expected parts always hashes to the original full digest;
 - every illegal session/part transition is rejected by both domain and PostgreSQL;
-- replaying prepare/reconcile/confirm/complete/abort is idempotent;
+- replaying immutable request IDs, prepare/reconcile/confirm/complete/abort is idempotent;
+- generated terminal attempts never reactivate and new request IDs allocate monotonically increasing
+  Blob-scoped generations;
 - arbitrary crash points between DB intent, provider call, and DB acknowledgement converge according
   to the failure matrix;
 - arbitrary lease expiry/takeover points yield at most one current mutation owner/epoch;
+- arbitrary completion-runner crash/heartbeat/takeover points yield at most one committed evidence
+  record and terminal transition;
 - a stale invocation never performs a successful fenced DB mutation, while late exact provider
   writes remain safely reconcilable;
-- provider part sets containing absence, duplication, size mismatch, checksum mismatch, and page
-  boundaries never produce false progress;
+- provider part sets containing absence, duplication, size mismatch, checksum mismatch, receipt
+  absence/mismatch, and page boundaries never produce false progress;
 - two completion histories produce at most one final object and one AVAILABLE attestation;
 - frozen session parameters never change under concurrent commands;
 - an AVAILABLE Blob/READY Version is unchanged under every generated M2 operation; and

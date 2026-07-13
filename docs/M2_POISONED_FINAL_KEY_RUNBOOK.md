@@ -17,15 +17,16 @@ below cannot be proven, stop and preserve the object for further investigation.
 - Never delete an object referenced by a `READY` DatasetVersion.
 - Never infer integrity from ETag, caller metadata, multipart composite checksum, or HTTP status.
 - Never use a wildcard/prefix deletion; operate on one exact deterministic key.
-- Stop API/CLI writes before deletion so DB/provider state cannot race the inspection.
+- Stop API/CLI writes and completion runners before deletion so DB/provider state cannot race the
+  inspection.
 - Preserve evidence before changing provider state.
 
 ## 1. Open an incident and quiesce writes
 
 Record an incident/correlation identifier, UTC start time, operator identity, reason, affected Blob
 SHA-256, Dataset/Version references, and the approval authorizing storage intervention. Stop the
-RoboLake API or otherwise prove no push/complete/abort request can run. Pull may remain unavailable
-for this non-AVAILABLE Blob.
+RoboLake API and completion runners, or otherwise prove no push/complete/abort/verification work can
+run. Pull may remain unavailable for this non-AVAILABLE Blob.
 
 Do not put credentials, presigned URLs, query strings, absolute source paths, or dataset bytes in the
 incident log. Use a separately configured least-privilege storage-operator alias; do not grant
@@ -68,7 +69,7 @@ JOIN datasets d ON d.id = dv.dataset_id
 WHERE b.sha256 = :blob_sha
 ORDER BY d.name, dv.version_number, de.relative_path;
 
-SELECT us.id, us.strategy, us.state, us.failure_code,
+SELECT us.id, us.session_generation, us.strategy, us.state, us.failure_code,
        us.verification_method, us.observed_sha256, us.observed_size_bytes,
        us.verification_read_bytes, us.verification_completed_at,
        us.created_at, us.last_activity_at, us.completed_at
@@ -85,6 +86,14 @@ JOIN multipart_admission_leases mal ON mal.upload_session_id = us.id
 WHERE b.sha256 = :blob_sha
 ORDER BY mal.expires_at DESC;
 
+SELECT mcl.upload_session_id, mcl.owner_instance_id, mcl.epoch, mcl.expires_at,
+       (mcl.expires_at > transaction_timestamp()) AS completion_lease_active
+FROM blobs b
+JOIN upload_sessions us ON us.blob_id = b.id
+JOIN multipart_completion_leases mcl ON mcl.upload_session_id = us.id
+WHERE b.sha256 = :blob_sha
+ORDER BY mcl.expires_at DESC;
+
 SELECT count(*) AS ready_reference_count
 FROM blobs b
 JOIN dataset_entries de ON de.blob_id = b.id
@@ -95,8 +104,8 @@ ROLLBACK;
 ```
 
 Stop immediately if the Blob row is absent, `state = 'AVAILABLE'`, `ready_reference_count <> 0`,
-`object_key` differs from the derived key, or a session is active in `CREATED`, `IN_PROGRESS`,
-`COMPLETING`, or `ABORTING`, or an admission lease is unexpired. An expired lease does not make the
+`object_key` differs from the derived key, or a session is active in `CREATED`, `INITIATING`,
+`IN_PROGRESS`, `COMPLETING`, or `ABORTING`, or an upload/completion lease is unexpired. An expired lease does not make the
 session safe to delete; reacquire it through the approved workflow and resolve/abort the persistent
 session first. Do not edit these rows manually, then restart this inspection from step 1.
 
@@ -151,7 +160,7 @@ approved M2 operation.
 An operator may delete the exact object only when all of the following are freshly proven and
 recorded:
 
-1. API/CLI writes are quiesced.
+1. API/CLI writes and completion runners are quiesced.
 2. The DB Blob exists and is not `AVAILABLE`.
 3. No `READY` DatasetVersion references the Blob.
 4. No active UploadSession/MPU exists for the Blob.
@@ -179,10 +188,10 @@ before restarting writes.
 
 ## 6. Recover and close
 
-Restore the API, rerun the same `robolake push`, and verify:
+Restore the API and completion runner, rerun the same `robolake push`, and verify:
 
 - the same immutable DatasetVersion/manifest is resolved;
-- a new MPU is used where required;
+- a new session generation and MPU are used where required;
 - the final object passes whole-object SHA-256;
 - Blob reaches `AVAILABLE` only through the normal verification transaction;
 - Version reaches `READY` only after every referenced Blob is AVAILABLE; and
