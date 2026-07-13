@@ -317,7 +317,8 @@ stateDiagram-v2
 ```
 
 A failed M1 session is replaced for the same Blob only after its cause is safe to retry; the sealed
-DatasetVersion is never changed. ABORTED and multipart expiry semantics enter with M2.
+DatasetVersion is never changed. `ABORTING`/`ABORTED` enter with M2; provider upload disappearance
+does not create an application `EXPIRED` session state.
 
 ### Blob
 
@@ -367,8 +368,9 @@ before persisting its upload ID. Storage stale-upload cleanup is the compensatin
   next only after current materialization. Replaying a cursor refreshes URL TTL without consuming it.
 - A GET connection failure discards the staging tree and M1 pull restarts; Range/pull resume is a
   later ADR.
-- M2 adds 72-hour multipart session expiry, paginated `ListParts`, part replacement, and
-  `NoSuchUpload` reconciliation without changing Blob/Version identity.
+- M2 adds paginated `ListParts`, part replacement, `NoSuchUpload` reconciliation, and a separate
+  expiring/fenced admission lease. Lease expiry releases execution capacity without expiring the
+  resumable session/provider MPU or changing Blob/Version identity.
 
 ## 12. Checksum policy
 
@@ -407,21 +409,25 @@ M1 contract-tests Linux/macOS and does not claim Windows/SMB filename semantics.
 atomic visibility under handled failures and normal process interruption, not persistence across
 power loss; complete directory-tree durability requires more than file-only `fsync`.
 
-## 14. Abandoned multipart cleanup
+## 14. M2 admission and abandoned multipart boundary
 
-Cleanup has two layers:
+M2 separates execution admission from provider cleanup:
 
-1. `robolake admin uploads cleanup --idle 72h` (or the equivalent application service) locks expired
-   sessions, calls `AbortMultipartUpload`, and marks them `ABORTED`. `NoSuchUpload` is reconciled with
-   the final object key before becoming a successful abort or verification candidate.
-2. Object storage expires untracked stale multipart uploads after seven days. AWS recommends the
+1. A short-lived PostgreSQL admission lease counts only active invocations. Expiry allows atomic
+   takeover with a higher fencing epoch but does not abort, delete, or expire the persistent session
+   or its provider MPU.
+2. The current fenced workflow may explicitly abort only its own incomplete provider upload.
+   `NoSuchUpload` is reconciled with the final object key before becoming an abort or completion
+   result.
+3. Object storage expires unknown/untracked stale multipart uploads after seven days. AWS recommends the
    `AbortIncompleteMultipartUpload` lifecycle action
    ([AWS lifecycle guidance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpu-abort-incomplete-mpu-lifecycle-config.html));
    MinIO exposes stale-upload expiry and cleanup settings
    ([MinIO server configuration](https://github.com/minio/minio/blob/master/docs/config/README.md)).
 
-Cleanup never deletes a completed object. Metrics report active/expired sessions and provider abort
-failures. The seven-day storage backstop is longer than the 72-hour application idle window.
+Cleanup never deletes a completed object. M2 has no background session sweeper or general Blob GC;
+broader abandoned-session maintenance remains M3. Metrics distinguish unexpired leases, persistent
+sessions, and provider abort failures.
 
 ## 15. Expected CLI workflow
 
@@ -465,7 +471,7 @@ Compose defines:
 
 - `postgres`: persistent volume, health check, non-root application database/user;
 - `minio`: persistent volume, S3 port and console port for local diagnostics, health check, and stale
-  multipart expiry configured longer than the application idle window;
+  multipart expiry as a backstop independent of application admission leases;
 - `minio-init`: one-shot creation of the unversioned blob bucket and least-privilege API service
   credentials;
 - `api`: Alembic migration check/startup, health endpoint, PostgreSQL and MinIO configuration;

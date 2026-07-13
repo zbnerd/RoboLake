@@ -1,6 +1,6 @@
 # ADR 0009: Multipart Final Publication
 
-- **Status:** Accepted
+- **Status:** Proposed
 - **Date:** 2026-07-13
 
 ## Context
@@ -25,6 +25,10 @@ Upload multipart directly to the deterministic final Blob key. Only the API subm
 `If-None-Match: *` and its provider-reconciled ordered part receipts. A 200, 412, 409, timeout, or
 lost response is not sufficient to mark success.
 
+ETags are opaque ordered completion receipts, not identifiers. Different part numbers may have
+identical ETags, provider checksums, and expected SHA-256 values when their bytes are identical;
+completion requires one matching receipt per expected part number but never receipt uniqueness.
+
 HTTP status 200 alone is never completion proof: CompleteMultipartUpload can embed an error after
 sending initial 200 headers. The SDK/provider adapter must parse and surface the final body outcome;
 an embedded error leaves the session non-terminal and triggers deterministic reconciliation.
@@ -34,6 +38,11 @@ entire object and compare its SHA-256/size with immutable Blob identity. Only an
 `Blob -> AVAILABLE` and session `COMPLETED`. A matching concurrent object is adopted. A mismatch
 returns `STORED_OBJECT_MISMATCH` and requires operator intervention; it is never overwritten or
 automatically deleted.
+
+The application records immutable `FULL_STREAM_SHA256` evidence: observed digest, observed size,
+verification-read bytes, completion time, and verifier implementation. PostgreSQL can enforce that
+these values structurally equal Blob identity; it cannot independently prove the external GET or
+hash computation occurred. Provider integration tests supply that proof.
 
 This supersedes only ADR 0004's prospective M2 claim that a provider system full-object SHA-256 is
 normally available for multipart. The pinned provider exposes only a composite SHA-256, so M2

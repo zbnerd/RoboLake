@@ -18,6 +18,7 @@ uploading the same content concurrently.
 
 - deterministically divide a large Blob into at most 10,000 parts;
 - persist one provider multipart upload and its intended part plan;
+- preserve that resumable session independently from a short-lived fenced admission lease;
 - issue short-lived, length- and SHA-256-bound UploadPart capabilities;
 - upload a small rolling window with bounded parallelism;
 - reconcile PostgreSQL with paginated provider `ListParts` results;
@@ -38,7 +39,8 @@ Linux/macOS filesystem contract.
 3. A lost completion response converges through the deterministic final key.
 4. Concurrent same-Blob pushes produce one immutable final object.
 5. Wrong parts, a poisoned final key, and unsafe local-file changes fail closed with stable actions.
-6. Normal PR CI proves the protocol with small provider-valid multipart objects; a scheduled/manual
+6. Abandoned invocations release admission capacity without discarding provider-confirmed parts.
+7. Normal PR CI proves the protocol with small provider-valid multipart objects; a scheduled/manual
    multi-GB profile supplies scale evidence.
 
 Poisoned non-`AVAILABLE` final keys remain outside automatic recovery. Operators use the
@@ -58,3 +60,6 @@ RoboLake remains a trusted-network modular monolith, not a production multi-tena
 session IDs are routing identifiers, not credentials. Presigned URLs are bearer capabilities and
 must never appear in logs or errors. `READY` still attests that publication verification passed; it
 does not promise that storage can never corrupt later.
+
+The first M2 deployment is offline: every v0.1.0 server is drained and stopped before migration and
+no mixed-version rolling rollout is supported.

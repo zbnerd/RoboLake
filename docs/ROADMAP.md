@@ -62,7 +62,7 @@ later milestones must not be pulled forward as speculative infrastructure.
 
 **Goal:** Resume inside multi-gigabyte files while retaining M1 identity and create-only semantics.
 
-**Design status:** Approved — 2026-07-13. Implementation has not begun. See the
+**Design status:** Under review in PR #5 — 2026-07-13. Implementation has not begun. See the
 [M2 product brief](M2_PRODUCT_BRIEF.md), [multipart architecture](M2_MULTIPART_ARCHITECTURE.md), and
 [implementation plan](M2_IMPLEMENTATION_PLAN.md).
 
@@ -72,6 +72,8 @@ later milestones must not be pulled forward as speculative infrastructure.
 - Freeze a deterministic 64 MiB-based plan within provider limits and 10,000 parts; issue an exact
   rolling window of short-lived part URLs.
 - Reconcile paginated `ListParts`, ambiguous completion, explicit abort, and `NoSuchUpload` outcomes.
+- Keep persistent resumable sessions separate from expiring, fenced admission leases so abandoned
+  invocations cannot permanently consume the global execution cap.
 - Complete directly at the final content-addressed key with `If-None-Match: *`, then stream the final
   object once to prove whole-file SHA-256 before `AVAILABLE`.
 - Bound abandoned incomplete MPUs with same-workflow abort and provider stale-upload expiry; do not
@@ -83,6 +85,8 @@ later milestones must not be pulled forward as speculative infrastructure.
 - Killing the CLI after arbitrary parts sends only absent/mismatched parts on rerun.
 - Concurrent completion cannot overwrite a completed Blob and converges on one object.
 - Lost Complete responses and `NoSuchUpload` converge through the deterministic final key.
+- Ambiguous non-409 partial completion resumes only through the guarded same-MPU recovery edge;
+  409/`NoSuchUpload` with no final starts a new MPU and retransmits every part.
 - Part receipts remain opaque; final integrity uses whole-byte SHA-256 and never treats ETag or a
   multipart composite checksum as Blob identity.
 - Normal PR CI uses small multipart fixtures; a scheduled/manual >5,000,000,000-byte profile proves

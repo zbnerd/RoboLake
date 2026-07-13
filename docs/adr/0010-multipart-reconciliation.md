@@ -1,6 +1,6 @@
 # ADR 0010: Multipart Reconciliation
 
-- **Status:** Accepted
+- **Status:** Proposed
 - **Date:** 2026-07-13
 
 ## Context
@@ -22,10 +22,22 @@ Use deterministic reconciliation rather than response interpretation:
 
 DB progress never overrides provider absence. A matching provider part becomes VERIFIED; absent or
 mismatching incomplete parts return to PENDING and may be replaced with the exact frozen bytes. A
-412 triggers final reconciliation. A 409 with no matching final ends that provider attempt because
-AWS requires a new MPU. The old upload ID and its parts are never resumed: after abort/invalidation,
-`RETRY_PUSH` creates a new MPU and uploads every part again. `NoSuchUpload` plus matching final
-completes; with no final it ends the attempt and creates a new one.
+412 triggers final reconciliation. After an ambiguous non-409 completion, final absence plus a
+structurally valid partial ListParts result for the same existing MPU permits guarded
+`COMPLETING -> IN_PROGRESS`: matching parts stay VERIFIED and only unresolved parts are retried. If
+all parts remain, the session stays COMPLETING and retries Complete.
+
+A 409 with no matching final ends that provider attempt because AWS requires a new MPU. The old
+upload ID and its parts are never resumed: after abort/invalidation, `RETRY_PUSH` creates a new
+session/MPU and uploads every part again. `NoSuchUpload` plus matching final completes; with no final
+it uses the same full-restart rule and maps to `MULTIPART_SESSION_NOT_FOUND`. RoboLake does not infer
+provider expiry from `NoSuchUpload`.
+
+Persistent sessions are fenced by separate expiring admission leases. Only unexpired leases count
+toward the global execution cap. Takeover increments the lease epoch without aborting the provider
+MPU; stale owners cannot mutate DB state or initiate control calls. A previously issued exact part
+URL or already dispatched API provider request may still settle, and the current owner reconciles
+that provider fact.
 
 Abort uses `ABORTING` until provider absence is proven. Explicit abort applies only to the same
 incomplete workflow; Ctrl-C preserves resumability. Provider seven-day stale cleanup bounds unknown
@@ -46,6 +58,8 @@ write.
 
 - Every control operation is replayable across API instances without server-memory ownership.
 - ListParts pagination and final full reads add provider requests and latency.
+- Lease heartbeat/takeover adds operational DB writes but prevents abandoned invocations from
+  permanently exhausting the global admission cap.
 - Retryable attempt failure does not invent a new DatasetVersion or mutate its manifest.
 - Operator intervention remains required for a mismatching final key.
 - M1 error envelope, derived actions, exit categories, and publication meanings remain intact.

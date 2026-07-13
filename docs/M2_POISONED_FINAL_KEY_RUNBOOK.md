@@ -69,11 +69,21 @@ WHERE b.sha256 = :blob_sha
 ORDER BY d.name, dv.version_number, de.relative_path;
 
 SELECT us.id, us.strategy, us.state, us.failure_code,
+       us.verification_method, us.observed_sha256, us.observed_size_bytes,
+       us.verification_read_bytes, us.verification_completed_at,
        us.created_at, us.last_activity_at, us.completed_at
 FROM blobs b
 JOIN upload_sessions us ON us.blob_id = b.id
 WHERE b.sha256 = :blob_sha
 ORDER BY us.created_at;
+
+SELECT mal.upload_session_id, mal.owner_id, mal.epoch, mal.expires_at,
+       (mal.expires_at > transaction_timestamp()) AS lease_active
+FROM blobs b
+JOIN upload_sessions us ON us.blob_id = b.id
+JOIN multipart_admission_leases mal ON mal.upload_session_id = us.id
+WHERE b.sha256 = :blob_sha
+ORDER BY mal.expires_at DESC;
 
 SELECT count(*) AS ready_reference_count
 FROM blobs b
@@ -86,8 +96,9 @@ ROLLBACK;
 
 Stop immediately if the Blob row is absent, `state = 'AVAILABLE'`, `ready_reference_count <> 0`,
 `object_key` differs from the derived key, or a session is active in `CREATED`, `IN_PROGRESS`,
-`COMPLETING`, or `ABORTING`. Do not edit these rows manually. Resolve/abort an active session through
-the approved application workflow, then restart this inspection from step 1.
+`COMPLETING`, or `ABORTING`, or an admission lease is unexpired. An expired lease does not make the
+session safe to delete; reacquire it through the approved workflow and resolve/abort the persistent
+session first. Do not edit these rows manually, then restart this inspection from step 1.
 
 ## 4. Inspect and stream-verify provider bytes
 

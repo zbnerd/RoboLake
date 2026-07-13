@@ -83,6 +83,34 @@ sent by `httpx.put` with those exact headers. No presigned URL or query string w
 | 18 | Inspect checksum after copy | Small CopyObject response omitted SHA-256; HEAD exposed a full-object SHA-256. Multipart UploadPartCopy with target `ChecksumAlgorithm=SHA256` failed 400 `InvalidArgument` (`checksum missing`); without it, copy worked but parts/final exposed no SHA-256. | Provider-specific. Multipart copy requires whole-final fallback verification on this MinIO. |
 | 19 | Concurrent conditional Complete from two MPUs to one key | Exactly one 200 and one 412; final bytes matched exactly one contender. Existing final survived a conditional challenge; losing MPU stayed listable and abortable. | AWS documents first-writer success and later 412; 409 is also possible. This is the selected publication primitive. |
 | 20 | List incomplete MPU, abort, list again | Count changed 1 -> 0 immediately. Compose config declares stale cleanup every 6 h with 168 h expiry. The seven-day timed expiry was not time-advanced or claimed as observed. | Explicit abort is standard. AWS recommends `AbortIncompleteMultipartUpload` lifecycle as a backstop; exact MinIO environment settings are provider-specific. |
+| 21 | Upload the same deterministic 6 MiB payload as part numbers 1 and 2 in one MPU, then ListParts | Both parts were present with different part numbers and equal sizes. Their ETags were identical and their provider `ChecksumSHA256` values were identical. The MPU was aborted; a final list of incomplete uploads returned zero probe MPUs. | ETag is opaque and content-derived implementations may repeat it for equal bytes. Neither ETag, provider checksum, nor expected digest may be unique across part numbers. Uniqueness belongs to part number and frozen range. |
+
+The independent review reproduced probe 21 with the application policy under a random synthetic
+`blobs/sha256/` key:
+
+```python
+payload = bytes(i % 251 for i in range(6 * 1024 * 1024))
+checksum = base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
+for part_number in (1, 2):
+    s3.upload_part(
+        Bucket=bucket,
+        Key=key,
+        UploadId=upload_id,
+        PartNumber=part_number,
+        ContentLength=len(payload),
+        ChecksumSHA256=checksum,
+        Body=payload,
+    )
+parts = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload_id)["Parts"]
+assert parts[0]["ETag"] == parts[1]["ETag"]
+assert parts[0]["ChecksumSHA256"] == parts[1]["ChecksumSHA256"]
+s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+assert not s3.list_multipart_uploads(Bucket=bucket, Prefix=key).get("Uploads", [])
+```
+
+Observed safe output was `part_numbers=[1, 2]`, `equal_etag=true`,
+`equal_checksum=true`, `part_size_bytes=6291456`, and
+`remaining_probe_multipart_uploads=0`. No URL, credential, upload ID, or object key was printed.
 
 ## Additional multipart-copy evidence
 
@@ -125,6 +153,11 @@ ChecksumType:   COMPOSITE
 The checksum equals `base64(SHA256(raw_sha256(part1) || raw_sha256(part2))) + "-2"`. The actual
 whole-file digest is different. RoboLake may use the composite value to diagnose exact part
 composition but must stream the final bytes to establish `Blob.sha256`.
+
+The follow-up identical-part probe also established that two different part numbers can expose the
+same opaque ETag and the same per-part checksum when their bytes are equal. This is a valid provider
+state, not a collision or plan error. The completion gate therefore checks an ordered receipt for
+every expected part number but never requires receipts or digests to be distinct.
 
 ## Completion response contract
 

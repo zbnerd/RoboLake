@@ -1,8 +1,9 @@
 # Architecture Decision Record Index
 
-Accepted ADRs 0001–0007 define the released RoboLake v0.1.0 baseline. Accepted ADRs 0008–0010 define
-the approved M2 multipart design. Accepted decisions must be revised through a new ADR rather than
-silently changed in implementation or deployment configuration.
+Accepted ADRs 0001–0007 define the released RoboLake v0.1.0 baseline. ADRs 0008–0010 are proposed by
+the unmerged M2 design PR and become Accepted only when that PR is merged. Accepted decisions must
+be revised through a new ADR rather than silently changed in implementation or deployment
+configuration; correcting a Proposed ADR in its original review does not require another ADR.
 
 | ADR | Decision | Status |
 | --- | --- | --- |
@@ -13,9 +14,9 @@ silently changed in implementation or deployment configuration.
 | [0005](adr/0005-modular-monolith.md) | Keep domain/application framework-free inside one Python deployable and shared CLI package. | Accepted |
 | [0006](adr/0006-m1-conditional-single-put-slice.md) | Use create-only conditional PUT, whole-Blob resume, reconciliation, and one-at-a-time pull capability. | Accepted |
 | [0007](adr/0007-failed-publication-and-manual-repair.md) | Detect, report, and stop on poisoned objects; do not guess, overwrite, delete, or auto-repair. | Accepted |
-| [0008](adr/0008-multipart-session-model.md) | Freeze deterministic multipart plans and reconcile provider parts inside one active Blob session. | Accepted |
-| [0009](adr/0009-multipart-final-publication.md) | Complete directly to the final key create-only and require full-byte SHA-256 before AVAILABLE. | Accepted |
-| [0010](adr/0010-multipart-reconciliation.md) | Resolve lost responses, NoSuchUpload, abort, and concurrency from provider facts plus deterministic identity. | Accepted |
+| [0008](adr/0008-multipart-session-model.md) | Freeze deterministic multipart plans, fence invocation leases, and reconcile provider parts inside one resumable Blob session. | Proposed |
+| [0009](adr/0009-multipart-final-publication.md) | Complete directly to the final key create-only and require full-byte SHA-256 before AVAILABLE. | Proposed |
+| [0010](adr/0010-multipart-reconciliation.md) | Resolve lost responses, NoSuchUpload, lease takeover, abort, and concurrency from provider facts plus deterministic identity. | Proposed |
 
 ## Reading order
 
