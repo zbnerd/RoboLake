@@ -54,10 +54,10 @@ stateDiagram-v2
     IN_PROGRESS --> ABORTING: explicit safe abort
     IN_PROGRESS --> FAILED: provider upload lost or fatal mismatch
     COMPLETING --> IN_PROGRESS: guarded partial same-MPU recovery
-    COMPLETING --> COMPLETED: final full SHA-256 verified; Blob AVAILABLE
+    COMPLETING --> COMPLETED: final full SHA-256 verified, Blob AVAILABLE
     COMPLETING --> FAILED: 409/NoSuchUpload without final, final mismatch, or unrecoverable attempt
     ABORTING --> ABORTED: provider absence proven
-    ABORTING --> COMPLETING: final appeared; enqueue server verification
+    ABORTING --> COMPLETING: final appeared, enqueue server verification
     ABORTING --> FAILED: mismatching final / unrecoverable invariant
     COMPLETED --> [*]
     ABORTED --> [*]

@@ -329,14 +329,14 @@ sequenceDiagram
     participant S3
     CLI->>CLI: stable scan with full and part SHA-256
     CLI->>API: create/resolve(request_id, plan)
-    API->>DB: bind request to generation; persist CREATED
+    API->>DB: bind request to generation, persist CREATED
     CLI->>API: acquire(request_id, invocation_id)
     API->>DB: owner, epoch, and expiry
     CLI->>API: initiate with owner/epoch
     API->>DB: CREATED -> INITIATING
     API->>S3: CreateMultipartUpload(final key, SHA256)
     S3-->>API: opaque upload ID
-    API->>DB: persist ID; INITIATING -> IN_PROGRESS
+    API->>DB: persist ID, INITIATING -> IN_PROGRESS
     loop rolling window
         CLI->>API: renew lease / request capabilities with epoch
         API-->>CLI: <= concurrency exact URLs
@@ -347,7 +347,7 @@ sequenceDiagram
         API->>DB: receipt-backed VERIFIED
     end
     CLI->>API: complete
-    API->>DB: COMPLETING + pending work; release upload lease
+    API->>DB: COMPLETING + pending work, release upload lease
     API-->>CLI: 202 Accepted
     Runner->>DB: claim completion lease
     Runner->>S3: Complete using stored response ETags + If-None-Match: *
@@ -385,7 +385,7 @@ sequenceDiagram
     Note over CLI2,S3: a matching part with lost response receipt is re-uploaded
     CLI2->>S3: upload unresolved parts
     CLI2->>API: complete
-    API-->>CLI2: 202; poll durable completion status
+    API-->>CLI2: 202, poll durable completion status
 ```
 
 ### Ambiguous provider initiation
@@ -404,7 +404,7 @@ sequenceDiagram
     API-->>CLI: RETRY_PUSH
     CLI->>API: retry with new request UUID
     API->>DB: allocate next generation
-    Note over API,S3: unknown upload ID is never guessed; lifecycle cleanup is the backstop
+    Note over API,S3: unknown upload ID is never guessed, lifecycle cleanup is the backstop
 ```
 
 ### Ambiguous Complete with partial same-MPU recovery
@@ -416,7 +416,7 @@ sequenceDiagram
     participant DB
     participant Runner
     participant S3
-    API->>DB: accept COMPLETING; release upload lease
+    API->>DB: accept COMPLETING, release upload lease
     Runner->>DB: claim completion lease
     Runner->>S3: conditional Complete
     S3--xRunner: non-409 result/response ambiguous
@@ -425,8 +425,8 @@ sequenceDiagram
     Runner->>S3: ListParts same upload ID
     S3-->>Runner: structurally valid subset
     Runner->>DB: guarded COMPLETING -> IN_PROGRESS
-    Runner->>DB: receipt-backed matches VERIFIED; others PENDING; release completion lease
-    CLI->>API: poll sees IN_PROGRESS; acquire upload lease
+    Runner->>DB: receipt-backed matches VERIFIED, others PENDING, release completion lease
+    CLI->>API: poll sees IN_PROGRESS, acquire upload lease
     API-->>CLI: upload only unresolved parts
 ```
 
@@ -442,14 +442,14 @@ sequenceDiagram
     S3-->>Runner: 409 or NoSuchUpload
     Runner->>S3: HEAD deterministic final key
     S3-->>Runner: absent
-    Runner->>DB: generation n FAILED; release completion lease
+    Runner->>DB: generation n FAILED, release completion lease
     Runner->>S3: best-effort abort old MPU where addressable
     CLI->>API: retry push with new request/invocation IDs
-    API->>DB: bind request to generation n+1; every part PENDING
+    API->>DB: bind request to generation n+1, every part PENDING
     CLI->>API: acquire upload lease and initiate
     API->>DB: CREATED -> INITIATING
     API->>S3: new MPU / new upload ID
-    API->>DB: durable ID; IN_PROGRESS
+    API->>DB: durable ID, IN_PROGRESS
     Note over API,S3: no old request mapping, provider receipt, or part observation is reused
 ```
 
@@ -468,7 +468,7 @@ sequenceDiagram
     R1->>DB: claim completion lease epoch 1
     R1->>S3: conditional CompleteMultipartUpload
     S3->>S3: object becomes visible
-    S3--xR1: response lost; runner stops heartbeating
+    S3--xR1: response lost, runner stops heartbeating
     CLI->>API: poll status (still COMPLETING)
     R2->>DB: claim after expiry with epoch 2
     R2->>S3: HEAD deterministic final key
@@ -515,7 +515,7 @@ sequenceDiagram
         API-->>CLI: reuse without new write or read
     else key exists but not attested
         API->>S3: HEAD final key
-        API->>DB: COMPLETING / FINAL_PRESENT; release upload lease
+        API->>DB: COMPLETING / FINAL_PRESENT, release upload lease
         API-->>CLI: 202 Accepted
         Runner->>DB: claim completion lease
         Runner->>S3: streamed GET
@@ -540,7 +540,7 @@ sequenceDiagram
     Runner->>DB: claim completion lease
     Runner->>S3: streamed GET final key
     Runner->>Runner: SHA-256 or size mismatch
-    Runner->>DB: fenced session FAILED; Blob remains non-AVAILABLE
+    Runner->>DB: fenced session FAILED, Blob remains non-AVAILABLE
     CLI->>API: poll status
     API-->>CLI: STORED_OBJECT_MISMATCH / CONTACT_OPERATOR
     Note over Runner,S3: no overwrite and no automatic delete
