@@ -22,6 +22,8 @@ from robolake.domain.multipart import (
     CompletionLeaseEpoch,
     CompletionLeaseOwnerId,
     CompletionPhase,
+    CompletionRecoveryAction,
+    CompletionRecoveryReason,
     MultipartInvocationId,
     MultipartSessionGeneration,
     MultipartSessionId,
@@ -124,16 +126,52 @@ class PartReconciliationResult:
 class PartialCompletionEvidence:
     """Provider observations required by guarded same-MPU recovery."""
 
+    recovery_reason: CompletionRecoveryReason
     final_absence_observed_at: datetime
     provider_reconciled_at: datetime
     provider_parts: tuple[ProviderPartObservation, ...]
-    completion_result: str = "AMBIGUOUS"
+    completion_result: str | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.final_absence_observed_at, "final_absence_observed_at")
         _require_aware(self.provider_reconciled_at, "provider_reconciled_at")
-        if self.completion_result not in {"AMBIGUOUS", "EMBEDDED_ERROR"}:
-            raise ContentConflictError("Completion evidence is not eligible for same-MPU recovery.")
+        same_mpu = self.recovery_reason in {
+            CompletionRecoveryReason.PARTS_READY,
+            CompletionRecoveryReason.PARTS_PARTIAL,
+        }
+        allowed_results = (
+            {None, "AMBIGUOUS", "EMBEDDED_ERROR"}
+            if same_mpu
+            else {
+                CompletionRecoveryReason.CONDITIONAL_409: {None, "CONFLICT_409"},
+                CompletionRecoveryReason.MULTIPART_SESSION_NOT_FOUND: {
+                    None,
+                    "NO_SUCH_UPLOAD",
+                },
+            }[self.recovery_reason]
+        )
+        if self.completion_result not in allowed_results:
+            raise ContentConflictError("Completion result contradicts its recovery reason.")
+        if (
+            self.recovery_reason
+            in {
+                CompletionRecoveryReason.CONDITIONAL_409,
+                CompletionRecoveryReason.MULTIPART_SESSION_NOT_FOUND,
+            }
+            and self.provider_parts
+        ):
+            raise ContentConflictError("Invalidated provider attempts cannot reuse observed Parts.")
+
+    @property
+    def persisted_completion_result(self) -> str:
+        """Return the closed provider result stored with recovery evidence."""
+        if self.completion_result is not None:
+            return self.completion_result
+        if self.recovery_reason is CompletionRecoveryReason.CONDITIONAL_409:
+            return "CONFLICT_409"
+        if self.recovery_reason is CompletionRecoveryReason.MULTIPART_SESSION_NOT_FOUND:
+            return "NO_SUCH_UPLOAD"
+        return "AMBIGUOUS"
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +197,14 @@ class MultipartUploadContext:
     session: MultipartUploadSessionRecord
     blob: BlobRecord
     parts: tuple[UploadPartRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionRecoveryResult:
+    """Deterministic action and persisted state after completion reconciliation."""
+
+    action: CompletionRecoveryAction
+    context: MultipartUploadContext
 
 
 def _require_aware(value: datetime, field_name: str) -> None:

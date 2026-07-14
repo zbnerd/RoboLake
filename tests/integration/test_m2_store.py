@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -116,3 +117,84 @@ def test_concurrent_creators_converge_on_one_active_generation(
             ).scalar_one()
             == 1
         )
+
+
+def test_concurrent_same_request_id_replays_the_winner_resource(
+    store_and_engine: tuple[SqlAlchemyStore, Engine],
+) -> None:
+    store, engine = store_and_engine
+    plan = HashedMultipartPlan.from_plan(build_multipart_plan())
+    with engine.begin() as connection:
+        _, version_id, blob_id = insert_large_registry_context(connection)
+    request_id = uuid4()
+    barrier = Barrier(2)
+
+    def create() -> MultipartUploadContext:
+        barrier.wait()
+        return store.create_or_resolve_multipart(request_id, version_id, blob_id, plan)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [executor.submit(create), executor.submit(create)]
+        first, second = (future.result() for future in results)
+
+    assert first == second
+
+
+def test_terminal_generation_concurrent_successors_converge_on_generation_two(
+    store_and_engine: tuple[SqlAlchemyStore, Engine],
+) -> None:
+    store, engine = store_and_engine
+    plan = HashedMultipartPlan.from_plan(build_multipart_plan())
+    with engine.begin() as connection:
+        _, version_id, blob_id = insert_large_registry_context(connection)
+    first = store.create_or_resolve_multipart(uuid4(), version_id, blob_id, plan)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE upload_sessions SET state = 'CANCELLED' WHERE id = :id"),
+            {"id": first.session.id.value},
+        )
+    barrier = Barrier(2)
+
+    def create() -> MultipartUploadContext:
+        barrier.wait()
+        return store.create_or_resolve_multipart(uuid4(), version_id, blob_id, plan)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [executor.submit(create), executor.submit(create)]
+        created = [future.result() for future in results]
+
+    assert created[0].session.id == created[1].session.id
+    assert created[0].session.generation.value == 2
+
+
+def test_request_serialization_recovers_when_prior_lock_owner_rolls_back(
+    store_and_engine: tuple[SqlAlchemyStore, Engine],
+) -> None:
+    store, engine = store_and_engine
+    plan = HashedMultipartPlan.from_plan(build_multipart_plan())
+    with engine.begin() as connection:
+        _, version_id, blob_id = insert_large_registry_context(connection)
+    request_id = uuid4()
+    identity = f"multipart-session-resolve\0{request_id}".encode()
+    lock_key = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
+
+    connection = engine.connect()
+    transaction = connection.begin()
+    connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                store.create_or_resolve_multipart,
+                request_id,
+                version_id,
+                blob_id,
+                plan,
+            )
+            transaction.rollback()
+            created = future.result(timeout=10)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
+
+    assert created.session.generation.value == 1

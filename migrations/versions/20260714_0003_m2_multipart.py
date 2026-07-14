@@ -264,6 +264,8 @@ def _create_part_plan_functions() -> None:
           actual_count bigint;
           actual_bytes bigint;
           invalid_ranges bigint;
+          minimum_part integer;
+          maximum_part integer;
           canonical text;
           actual_hash text;
         BEGIN
@@ -280,28 +282,20 @@ def _create_part_plan_functions() -> None:
               USING ERRCODE = '23514';
           END IF;
 
-          SELECT count(*), coalesce(sum(size_bytes), 0)
-            INTO actual_count, actual_bytes
-            FROM upload_parts WHERE upload_session_id = target_session;
-          SELECT count(*) INTO invalid_ranges
+          SELECT count(*), coalesce(sum(size_bytes), 0), min(part_number), max(part_number),
+                 count(*) FILTER (WHERE
+                   part_number < 1 OR part_number > selected.planned_part_count OR
+                   offset_bytes <> (part_number - 1)::bigint * selected.part_size_bytes OR
+                   (part_number < selected.planned_part_count AND
+                    size_bytes <> selected.part_size_bytes) OR
+                   (part_number = selected.planned_part_count AND
+                    size_bytes <> blob_size - offset_bytes)
+                 )
+            INTO actual_count, actual_bytes, minimum_part, maximum_part, invalid_ranges
             FROM upload_parts part
-            WHERE part.upload_session_id = target_session AND (
-              part.part_number <> 1 + (
-                SELECT count(*) FROM upload_parts prior
-                WHERE prior.upload_session_id = target_session
-                  AND prior.part_number < part.part_number
-              ) OR
-              part.offset_bytes <> coalesce((
-                SELECT sum(prior.size_bytes) FROM upload_parts prior
-                WHERE prior.upload_session_id = target_session
-                  AND prior.part_number < part.part_number
-              ), 0) OR
-              (part.part_number < selected.planned_part_count AND
-               part.size_bytes <> selected.part_size_bytes) OR
-              (part.part_number = selected.planned_part_count AND
-               (part.size_bytes < 1 OR part.size_bytes > selected.part_size_bytes))
-            );
+            WHERE part.upload_session_id = target_session;
           IF actual_count <> selected.planned_part_count OR actual_bytes <> blob_size OR
+             minimum_part <> 1 OR maximum_part <> selected.planned_part_count OR
              invalid_ranges <> 0 THEN
             RAISE EXCEPTION 'multipart Part rows do not cover the Blob exactly once'
               USING ERRCODE = '23514';
@@ -328,25 +322,6 @@ def _create_part_plan_functions() -> None:
         $$
         """
     )
-    op.execute(
-        """
-        CREATE FUNCTION robolake_require_valid_multipart_session_plan() RETURNS trigger
-        LANGUAGE plpgsql AS $$
-        BEGIN
-          PERFORM robolake_validate_multipart_plan(NEW.id);
-          RETURN NULL;
-        END;
-        $$
-        """
-    )
-    op.execute(
-        """
-        CREATE CONSTRAINT TRIGGER multipart_session_plan_is_valid
-        AFTER INSERT OR UPDATE ON upload_sessions
-        DEFERRABLE INITIALLY DEFERRED
-        FOR EACH ROW EXECUTE FUNCTION robolake_require_valid_multipart_session_plan()
-        """
-    )
 
 
 def _create_guard_functions() -> None:
@@ -359,7 +334,6 @@ def _create_guard_functions() -> None:
           parent_state text;
           expected_checksum text;
           planned_count integer;
-          current_count bigint;
         BEGIN
           IF TG_OP = 'DELETE' THEN
             RAISE EXCEPTION 'multipart Part rows are immutable plan members'
@@ -373,10 +347,8 @@ def _create_guard_functions() -> None:
           IF TG_OP = 'INSERT' THEN
             SELECT planned_part_count INTO planned_count
               FROM upload_sessions WHERE id = NEW.upload_session_id;
-            SELECT count(*) INTO current_count
-              FROM upload_parts WHERE upload_session_id = NEW.upload_session_id;
-            IF current_count >= planned_count THEN
-              RAISE EXCEPTION 'multipart PartPlan already contains its planned row count'
+            IF parent_state <> 'CREATED' OR NEW.part_number > planned_count THEN
+              RAISE EXCEPTION 'multipart Part insertion requires an unsealed planned position'
                 USING ERRCODE = '23514';
             END IF;
           END IF;
@@ -500,6 +472,24 @@ def _create_guard_functions() -> None:
             RAISE EXCEPTION 'accepted completion reason is immutable while work is pending'
               USING ERRCODE = '23514';
           END IF;
+          IF OLD.state = 'COMPLETING' AND NEW.state = 'COMPLETING' AND
+             NEW.completion_phase IS DISTINCT FROM OLD.completion_phase AND NOT (
+               (OLD.completion_phase = 'PENDING' AND NEW.completion_phase = 'ASSEMBLING') OR
+               (OLD.completion_phase = 'PENDING' AND NEW.completion_phase = 'FINAL_PRESENT' AND
+                NEW.completion_reason = 'FINAL_PRESENT') OR
+               (OLD.completion_phase = 'ASSEMBLING' AND
+                NEW.completion_phase = 'FINAL_PRESENT') OR
+               (OLD.completion_phase = 'ASSEMBLING' AND NEW.completion_phase = 'PENDING' AND
+                NEW.completion_attempted_at IS NOT NULL AND
+                NEW.last_completion_result IN ('AMBIGUOUS','EMBEDDED_ERROR')) OR
+               (OLD.completion_phase = 'FINAL_PRESENT' AND
+                NEW.completion_phase = 'FINAL_VERIFICATION') OR
+               (OLD.completion_phase = 'FINAL_VERIFICATION' AND
+                NEW.completion_phase = 'FINAL_PRESENT')
+             ) THEN
+            RAISE EXCEPTION 'illegal multipart completion phase transition'
+              USING ERRCODE = '23514';
+          END IF;
           IF NEW.state IS DISTINCT FROM OLD.state AND NOT (
             (OLD.state = 'CREATED' AND NEW.state IN ('INITIATING','CANCELLED','FAILED')) OR
             (OLD.state = 'INITIATING' AND NEW.state IN ('IN_PROGRESS','FAILED')) OR
@@ -532,6 +522,10 @@ def _create_guard_functions() -> None:
               RAISE EXCEPTION 'multipart completion requires durable work metadata'
                 USING ERRCODE = '23514';
             END IF;
+            IF OLD.state <> 'COMPLETING' AND NEW.completion_phase <> 'PENDING' THEN
+              RAISE EXCEPTION 'accepted completion must begin in PENDING phase'
+                USING ERRCODE = '23514';
+            END IF;
             IF NEW.completion_reason = 'PARTS_READY' THEN
               SELECT count(*) INTO unresolved_parts FROM upload_parts
                 WHERE upload_session_id = NEW.id AND state <> 'VERIFIED';
@@ -543,8 +537,20 @@ def _create_guard_functions() -> None:
           END IF;
           IF OLD.state = 'COMPLETING' AND NEW.state = 'IN_PROGRESS' AND (
              NEW.final_absence_observed_at IS NULL OR NEW.last_provider_reconciled_at IS NULL OR
-             NEW.last_completion_result = 'CONFLICT_409') THEN
+             NEW.last_completion_result NOT IN ('AMBIGUOUS','EMBEDDED_ERROR') OR
+             (OLD.completion_reason = 'PARTS_READY' AND NOT EXISTS (
+               SELECT 1 FROM upload_parts
+               WHERE upload_session_id = NEW.id AND state <> 'VERIFIED'
+             ))) THEN
             RAISE EXCEPTION 'multipart recovery lacks guarded provider evidence'
+              USING ERRCODE = '23514';
+          END IF;
+          IF OLD.state = 'COMPLETING' AND NEW.state = 'FAILED' AND
+             NEW.failure_code = 'PROVIDER_ATTEMPT_INVALIDATED' AND (
+               NEW.provider_attempt_invalidated_at IS NULL OR
+               NEW.last_completion_result NOT IN ('CONFLICT_409','NO_SUCH_UPLOAD')
+             ) THEN
+            RAISE EXCEPTION 'provider attempt invalidation lacks terminal evidence'
               USING ERRCODE = '23514';
           END IF;
           IF NEW.state = 'ABORTING' AND NEW.abort_requested_at IS NULL THEN
@@ -552,7 +558,9 @@ def _create_guard_functions() -> None:
           END IF;
           IF NEW.state = 'COMPLETED' THEN
             SELECT * INTO related_blob FROM blobs WHERE id = NEW.blob_id;
-            IF related_blob.state <> 'AVAILABLE' OR
+            IF OLD.completion_phase <> 'FINAL_VERIFICATION' OR
+               NEW.completion_phase <> 'FINAL_VERIFICATION' OR
+               related_blob.state <> 'AVAILABLE' OR
                NEW.verification_method <> 'FULL_STREAM_SHA256' OR
                NEW.observed_sha256 IS DISTINCT FROM related_blob.sha256 OR
                NEW.observed_size_bytes IS DISTINCT FROM related_blob.size_bytes OR
@@ -639,14 +647,20 @@ def _create_guard_functions() -> None:
             RAISE EXCEPTION 'completion lease identity and epoch are monotonic'
               USING ERRCODE = '23514';
           END IF;
-          IF NEW.owner_instance_id IS DISTINCT FROM OLD.owner_instance_id THEN
-            IF OLD.expires_at > clock_timestamp() OR NEW.epoch <> OLD.epoch + 1 OR
-               NEW.acquired_at <= OLD.acquired_at THEN
+          IF NEW.epoch = OLD.epoch THEN
+            IF NEW.owner_instance_id IS DISTINCT FROM OLD.owner_instance_id OR
+               NEW.acquired_at IS DISTINCT FROM OLD.acquired_at OR
+               OLD.expires_at <= clock_timestamp() THEN
+              RAISE EXCEPTION 'completion renewal requires the current unexpired owner and epoch'
+                USING ERRCODE = '23514';
+            END IF;
+          ELSIF NEW.epoch = OLD.epoch + 1 THEN
+            IF OLD.expires_at > clock_timestamp() OR NEW.acquired_at <= OLD.acquired_at THEN
               RAISE EXCEPTION 'completion takeover requires an expired prior epoch'
                 USING ERRCODE = '23514';
             END IF;
-          ELSIF NEW.epoch <> OLD.epoch OR NEW.acquired_at IS DISTINCT FROM OLD.acquired_at THEN
-            RAISE EXCEPTION 'completion renewal cannot change epoch or acquisition time'
+          ELSE
+            RAISE EXCEPTION 'completion lease epoch must renew or advance exactly once'
               USING ERRCODE = '23514';
           END IF;
           RETURN NEW;
@@ -702,6 +716,126 @@ def _create_guard_functions() -> None:
     )
 
 
+def _create_publication_invariant() -> None:
+    op.execute(
+        """
+        CREATE FUNCTION robolake_validate_m2_publication(target_blob uuid) RETURNS void
+        LANGUAGE plpgsql AS $$
+        DECLARE
+          selected_blob blobs%ROWTYPE;
+          has_multipart boolean;
+          has_completed boolean;
+          has_valid_completion boolean;
+          has_nonterminal boolean;
+        BEGIN
+          SELECT * INTO selected_blob FROM blobs WHERE id = target_blob;
+          IF NOT FOUND THEN
+            RETURN;
+          END IF;
+          SELECT EXISTS (
+            SELECT 1 FROM upload_sessions
+            WHERE blob_id = target_blob AND strategy = 'MULTIPART'
+          ) INTO has_multipart;
+          IF NOT has_multipart THEN
+            RETURN;
+          END IF;
+
+          SELECT EXISTS (
+            SELECT 1 FROM upload_sessions
+            WHERE blob_id = target_blob AND strategy = 'MULTIPART' AND state = 'COMPLETED'
+          ) INTO has_completed;
+          SELECT EXISTS (
+            SELECT 1 FROM upload_sessions session
+            WHERE session.blob_id = target_blob
+              AND session.strategy = 'MULTIPART'
+              AND session.state = 'COMPLETED'
+              AND session.completion_phase = 'FINAL_VERIFICATION'
+              AND session.verification_method = 'FULL_STREAM_SHA256'
+              AND session.observed_sha256 = selected_blob.sha256
+              AND session.observed_size_bytes = selected_blob.size_bytes
+              AND session.verification_read_bytes = selected_blob.size_bytes
+              AND session.verification_completed_at IS NOT NULL
+              AND session.verifier_implementation IS NOT NULL
+              AND session.verifier_implementation <> ''
+          ) INTO has_valid_completion;
+          SELECT EXISTS (
+            SELECT 1 FROM upload_sessions
+            WHERE blob_id = target_blob AND strategy = 'MULTIPART'
+              AND state IN ('CREATED','INITIATING','IN_PROGRESS','COMPLETING','ABORTING')
+          ) INTO has_nonterminal;
+
+          IF selected_blob.state = 'VERIFYING' THEN
+            RAISE EXCEPTION 'multipart Blob cannot remain VERIFYING at transaction commit'
+              USING ERRCODE = '23514';
+          END IF;
+          IF selected_blob.state = 'AVAILABLE' AND
+             (NOT has_valid_completion OR has_nonterminal) THEN
+            RAISE EXCEPTION 'AVAILABLE multipart Blob lacks one completed verified publication'
+              USING ERRCODE = '23514';
+          END IF;
+          IF has_completed AND selected_blob.state <> 'AVAILABLE' THEN
+            RAISE EXCEPTION 'completed multipart Session requires an AVAILABLE Blob'
+              USING ERRCODE = '23514';
+          END IF;
+          IF EXISTS (
+            SELECT 1 FROM upload_sessions session
+            JOIN multipart_completion_leases lease
+              ON lease.upload_session_id = session.id
+            WHERE session.blob_id = target_blob
+              AND session.strategy = 'MULTIPART'
+              AND session.state = 'FAILED'
+              AND session.failure_code = 'PROVIDER_ATTEMPT_INVALIDATED'
+              AND lease.expires_at > clock_timestamp()
+          ) THEN
+            RAISE EXCEPTION 'invalidated provider attempt retains completion ownership'
+              USING ERRCODE = '23514';
+          END IF;
+        END;
+        $$
+        """
+    )
+    op.execute(
+        """
+        CREATE FUNCTION robolake_require_m2_publication_for_session() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM robolake_validate_m2_publication(
+            CASE WHEN TG_OP = 'DELETE' THEN OLD.blob_id ELSE NEW.blob_id END
+          );
+          RETURN NULL;
+        END;
+        $$
+        """
+    )
+    op.execute(
+        """
+        CREATE CONSTRAINT TRIGGER multipart_session_publication_is_consistent
+        AFTER INSERT OR UPDATE OR DELETE ON upload_sessions
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION robolake_require_m2_publication_for_session()
+        """
+    )
+    op.execute(
+        """
+        CREATE FUNCTION robolake_require_m2_publication_for_blob() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM robolake_validate_m2_publication(NEW.id);
+          RETURN NULL;
+        END;
+        $$
+        """
+    )
+    op.execute(
+        """
+        CREATE CONSTRAINT TRIGGER multipart_blob_publication_is_consistent
+        AFTER UPDATE ON blobs
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION robolake_require_m2_publication_for_blob()
+        """
+    )
+
+
 def upgrade() -> None:
     op.execute("DROP TRIGGER guard_upload_session ON upload_sessions")
     op.execute("DROP FUNCTION robolake_guard_upload_session()")
@@ -715,6 +849,7 @@ def upgrade() -> None:
     _create_lease_tables()
     _create_part_plan_functions()
     _create_guard_functions()
+    _create_publication_invariant()
 
 
 def _drop_session_columns() -> None:
@@ -766,6 +901,11 @@ def downgrade() -> None:
         """
     )
 
+    op.execute("DROP TRIGGER multipart_blob_publication_is_consistent ON blobs")
+    op.execute("DROP FUNCTION robolake_require_m2_publication_for_blob()")
+    op.execute("DROP TRIGGER multipart_session_publication_is_consistent ON upload_sessions")
+    op.execute("DROP FUNCTION robolake_require_m2_publication_for_session()")
+    op.execute("DROP FUNCTION robolake_validate_m2_publication(uuid)")
     op.execute("DROP TRIGGER guard_m2_idempotency ON idempotency_records")
     op.execute("DROP FUNCTION robolake_guard_m2_idempotency()")
     op.execute("DROP TRIGGER guard_completion_lease ON multipart_completion_leases")
@@ -774,8 +914,6 @@ def downgrade() -> None:
     op.execute("DROP FUNCTION robolake_guard_admission_lease()")
     op.execute("DROP TRIGGER guard_upload_session ON upload_sessions")
     op.execute("DROP FUNCTION robolake_guard_upload_session()")
-    op.execute("DROP TRIGGER multipart_session_plan_is_valid ON upload_sessions")
-    op.execute("DROP FUNCTION robolake_require_valid_multipart_session_plan()")
     op.execute("DROP TRIGGER guard_upload_part ON upload_parts")
     op.execute("DROP FUNCTION robolake_guard_upload_part()")
     op.execute("DROP FUNCTION robolake_validate_multipart_plan(uuid)")

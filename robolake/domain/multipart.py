@@ -62,7 +62,7 @@ class MultipartSessionGeneration:
     value: int
 
     def __post_init__(self) -> None:
-        if self.value <= 0:
+        if type(self.value) is not int or self.value <= 0:
             raise ValueError("Multipart session generation must be positive.")
 
 
@@ -71,7 +71,7 @@ class AdmissionLeaseEpoch:
     value: int
 
     def __post_init__(self) -> None:
-        if self.value <= 0:
+        if type(self.value) is not int or self.value <= 0:
             raise ValueError("Admission lease epoch must be positive.")
 
 
@@ -80,7 +80,7 @@ class CompletionLeaseEpoch:
     value: int
 
     def __post_init__(self) -> None:
-        if self.value <= 0:
+        if type(self.value) is not int or self.value <= 0:
             raise ValueError("Completion lease epoch must be positive.")
 
 
@@ -93,6 +93,11 @@ class MultipartPart:
     size_bytes: int
 
     def __post_init__(self) -> None:
+        _require_protocol_integers(
+            part_number=self.part_number,
+            offset_bytes=self.offset_bytes,
+            size_bytes=self.size_bytes,
+        )
         if not 1 <= self.part_number <= MAX_PARTS:
             raise ManifestMismatchError("Multipart part number is outside 1..10,000.")
         if self.offset_bytes < 0 or self.size_bytes <= 0:
@@ -108,14 +113,25 @@ class MultipartPlan:
     parts: tuple[MultipartPart, ...]
 
     def __post_init__(self) -> None:
+        _require_protocol_integers(
+            blob_size_bytes=self.blob_size_bytes,
+            part_size_bytes=self.part_size_bytes,
+        )
         if self.blob_size_bytes <= 0 or self.blob_size_bytes > MAX_MULTIPART_BLOB_BYTES:
             raise ManifestMismatchError("Multipart Blob size is outside the protocol limit.")
         if not BASE_PART_BYTES <= self.part_size_bytes <= MAX_PART_BYTES:
             raise ManifestMismatchError("Selected multipart part size is outside protocol limits.")
+        if self.part_size_bytes != _select_part_size(self.blob_size_bytes):
+            raise ManifestMismatchError("Multipart part size differs from the protocol algorithm.")
         _validate_ranges(self.blob_size_bytes, self.part_size_bytes, self.parts)
 
 
-def _selected_part_size(size_bytes: int) -> int:
+def _require_protocol_integers(**values: int) -> None:
+    if any(type(value) is not int for value in values.values()):
+        raise ManifestMismatchError("Multipart protocol integer fields require exact int values.")
+
+
+def _select_part_size(size_bytes: int) -> int:
     part_size = BASE_PART_BYTES
     while _ceil_div(size_bytes, part_size) > MAX_PARTS:
         part_size *= 2
@@ -124,15 +140,25 @@ def _selected_part_size(size_bytes: int) -> int:
     return part_size
 
 
+def select_multipart_part_size(blob_size_bytes: int) -> int:
+    """Select the one protocol part size for a valid M2 Blob."""
+    if (
+        type(blob_size_bytes) is not int
+        or not MAX_SINGLE_PUT_BYTES < blob_size_bytes <= MAX_MULTIPART_BLOB_BYTES
+    ):
+        raise UnsupportedFileSizeError("multipart", blob_size_bytes)
+    return _select_part_size(blob_size_bytes)
+
+
 def _ceil_div(dividend: int, divisor: int) -> int:
     return (dividend + divisor - 1) // divisor
 
 
 def plan_part_boundaries(size_bytes: int) -> MultipartPlan:
     """Build deterministic boundaries independent of M1/M2 routing selection."""
-    if not 0 < size_bytes <= MAX_MULTIPART_BLOB_BYTES:
+    if type(size_bytes) is not int or not 0 < size_bytes <= MAX_MULTIPART_BLOB_BYTES:
         raise UnsupportedFileSizeError("multipart", size_bytes)
-    part_size = _selected_part_size(size_bytes)
+    part_size = _select_part_size(size_bytes)
     count = _ceil_div(size_bytes, part_size)
     parts = tuple(
         MultipartPart(
@@ -147,8 +173,7 @@ def plan_part_boundaries(size_bytes: int) -> MultipartPlan:
 
 def plan_multipart(size_bytes: int) -> MultipartPlan:
     """Build the frozen M2 boundary plan for a Blob above the M1 threshold."""
-    if not MAX_SINGLE_PUT_BYTES < size_bytes <= MAX_MULTIPART_BLOB_BYTES:
-        raise UnsupportedFileSizeError("multipart", size_bytes)
+    select_multipart_part_size(size_bytes)
     return plan_part_boundaries(size_bytes)
 
 
@@ -175,12 +200,17 @@ class PartPlan:
     parts: tuple[PartDefinition, ...]
 
     def __post_init__(self) -> None:
+        _require_protocol_integers(
+            schema_version=self.schema_version,
+            blob_size_bytes=self.blob_size_bytes,
+            part_size_bytes=self.part_size_bytes,
+        )
         if self.schema_version != PART_PLAN_SCHEMA_VERSION:
             raise ManifestMismatchError("Unsupported multipart PartPlan schema version.")
-        if self.blob_size_bytes <= 0 or self.blob_size_bytes > MAX_MULTIPART_BLOB_BYTES:
+        if not MAX_SINGLE_PUT_BYTES < self.blob_size_bytes <= MAX_MULTIPART_BLOB_BYTES:
             raise ManifestMismatchError("PartPlan Blob size is outside protocol limits.")
-        if self.part_size_bytes <= 0 or self.part_size_bytes > MAX_PART_BYTES:
-            raise ManifestMismatchError("PartPlan part size is outside provider limits.")
+        if self.part_size_bytes != select_multipart_part_size(self.blob_size_bytes):
+            raise ManifestMismatchError("PartPlan part size differs from the protocol algorithm.")
         _validate_ranges(self.blob_size_bytes, self.part_size_bytes, self.parts)
 
     @classmethod
@@ -351,6 +381,7 @@ class CompletedPartReceipt:
     response_checksum_sha256_base64: str
 
     def __post_init__(self) -> None:
+        _require_protocol_integers(part_number=self.part_number)
         if not 1 <= self.part_number <= MAX_PARTS:
             raise ContentConflictError("CompletedPart receipt number is outside 1..10,000.")
         if not self.response_etag:
@@ -402,6 +433,19 @@ class CompletionPhase(StrEnum):
 class CompletionReason(StrEnum):
     PARTS_READY = "PARTS_READY"
     FINAL_PRESENT = "FINAL_PRESENT"
+
+
+class CompletionRecoveryReason(StrEnum):
+    PARTS_READY = "PARTS_READY"
+    PARTS_PARTIAL = "PARTS_PARTIAL"
+    CONDITIONAL_409 = "CONDITIONAL_409"
+    MULTIPART_SESSION_NOT_FOUND = "MULTIPART_SESSION_NOT_FOUND"
+
+
+class CompletionRecoveryAction(StrEnum):
+    RETRY_COMPLETION = "RETRY_COMPLETION"
+    RESUME_PART_UPLOAD = "RESUME_PART_UPLOAD"
+    START_NEW_GENERATION = "START_NEW_GENERATION"
 
 
 class MultipartFailureReason(StrEnum):
@@ -477,17 +521,37 @@ def require_upload_part_transition(
 
 _COMPLETION_PHASE_EDGES = {
     (CompletionPhase.PENDING, CompletionPhase.ASSEMBLING),
-    (CompletionPhase.PENDING, CompletionPhase.FINAL_PRESENT),
-    (CompletionPhase.ASSEMBLING, CompletionPhase.PENDING),
     (CompletionPhase.ASSEMBLING, CompletionPhase.FINAL_PRESENT),
     (CompletionPhase.FINAL_PRESENT, CompletionPhase.FINAL_VERIFICATION),
-    (CompletionPhase.FINAL_VERIFICATION, CompletionPhase.FINAL_PRESENT),
 }
 
 
 def require_completion_phase_transition(
-    current: CompletionPhase, target: CompletionPhase
+    current: CompletionPhase,
+    target: CompletionPhase,
+    *,
+    final_present_observed: bool = False,
+    retryable_reconciliation: bool = False,
+    transient_read_failure: bool = False,
 ) -> CompletionPhase:
     if current == target or (current, target) in _COMPLETION_PHASE_EDGES:
+        return target
+    if (
+        final_present_observed
+        and current is CompletionPhase.PENDING
+        and target is CompletionPhase.FINAL_PRESENT
+    ):
+        return target
+    if (
+        retryable_reconciliation
+        and current is CompletionPhase.ASSEMBLING
+        and target is CompletionPhase.PENDING
+    ):
+        return target
+    if (
+        transient_read_failure
+        and current is CompletionPhase.FINAL_VERIFICATION
+        and target is CompletionPhase.FINAL_PRESENT
+    ):
         return target
     raise IllegalTransitionError(f"Completion phase cannot transition from {current} to {target}.")

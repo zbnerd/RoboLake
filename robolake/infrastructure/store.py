@@ -47,6 +47,8 @@ from robolake.domain.multipart import (
     CompletionLeaseEpoch,
     CompletionLeaseOwnerId,
     CompletionPhase,
+    CompletionRecoveryAction,
+    CompletionRecoveryReason,
     MultipartInvocationId,
     MultipartSessionGeneration,
     MultipartSessionId,
@@ -55,6 +57,7 @@ from robolake.domain.multipart import (
     PartDefinition,
     PartPlan,
     UploadPartState,
+    require_completion_phase_transition,
 )
 from robolake.domain.records import (
     AcceptedCompletion,
@@ -62,6 +65,7 @@ from robolake.domain.records import (
     BlobRecord,
     CompletionClaim,
     CompletionLeaseRecord,
+    CompletionRecoveryResult,
     ContentStatus,
     DatasetRecord,
     HashedMultipartPlan,
@@ -392,6 +396,7 @@ class SqlAlchemyStore:
                 upload = session.get(UploadSessionModel, replay.resource_id)
                 if upload is None:
                     raise IdempotencyConflictError("Idempotency upload session is unavailable.")
+                _require_single_put_session(upload)
                 return _upload_context(version, dataset.name, blob, upload)
 
             upload = session.scalar(
@@ -422,6 +427,7 @@ class SqlAlchemyStore:
                 )
             if upload is None:
                 raise ContentConflictError("Blob state has no recoverable upload session.")
+            _require_single_put_session(upload)
             session.add(
                 IdempotencyRecordModel(
                     scope="upload-session-create",
@@ -441,6 +447,7 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id)
             if upload is None:
                 raise NotFoundError("UploadSession does not exist.")
+            _require_single_put_session(upload)
             return self._load_upload_context(session, upload)
 
     def mark_upload_in_progress(self, session_id: UUID) -> UploadContext:
@@ -449,6 +456,7 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id, with_for_update=True)
             if upload is None:
                 raise NotFoundError("UploadSession does not exist.")
+            _require_single_put_session(upload)
             blob = session.get(BlobModel, upload.blob_id, with_for_update=True)
             version = session.get(
                 DatasetVersionModel,
@@ -480,6 +488,7 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id, with_for_update=True)
             if upload is None:
                 raise NotFoundError("UploadSession does not exist.")
+            _require_single_put_session(upload)
             blob = session.get(BlobModel, upload.blob_id, with_for_update=True)
             version = session.get(DatasetVersionModel, upload.initiating_version_id)
             if blob is None or version is None:
@@ -514,6 +523,7 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id, with_for_update=True)
             if upload is None:
                 raise NotFoundError("UploadSession does not exist.")
+            _require_single_put_session(upload)
             blob = session.get(BlobModel, upload.blob_id, with_for_update=True)
             version = session.get(
                 DatasetVersionModel,
@@ -593,7 +603,17 @@ class SqlAlchemyStore:
                 prior = session.get(UploadSessionModel, replay.resource_id)
                 if prior is None:
                     raise IdempotencyConflictError("Idempotency upload session is unavailable.")
+                _require_single_put_session(prior)
                 return _upload_context(version, dataset.name, blob, prior)
+            prior = session.scalar(
+                select(UploadSessionModel)
+                .where(UploadSessionModel.blob_id == blob_id)
+                .order_by(UploadSessionModel.created_at.desc())
+                .with_for_update()
+                .limit(1)
+            )
+            if prior is not None:
+                _require_single_put_session(prior)
             if version.state != VersionState.FAILED.value or blob.state != BlobState.FAILED.value:
                 raise IllegalTransitionError("Only a failed Blob and Version can be restarted.")
             version.state = VersionState.UPLOADING.value
@@ -684,6 +704,7 @@ class SqlAlchemyStore:
         )
         key = str(request_id)
         with self._sessions.begin() as session:
+            _lock_multipart_request(session, "multipart-session-resolve", key)
             replay = session.get(
                 IdempotencyRecordModel,
                 {"scope": "multipart-session-resolve", "key": key},
@@ -807,11 +828,10 @@ class SqlAlchemyStore:
             "multipart-admission-acquire",
             str(session_id),
             str(invocation_id),
-            str(ttl_seconds),
-            str(capacity),
         )
         key = str(request_id)
         with self._sessions.begin() as session:
+            _lock_multipart_request(session, "multipart-admission-acquire", key)
             replay = session.get(
                 IdempotencyRecordModel,
                 {"scope": "multipart-admission-acquire", "key": key},
@@ -823,13 +843,14 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id, with_for_update=True)
             if upload is None or upload.strategy != "MULTIPART":
                 raise NotFoundError("Multipart session does not exist.")
-            if upload.state in {
-                MultipartSessionState.COMPLETED.value,
-                MultipartSessionState.ABORTED.value,
-                MultipartSessionState.CANCELLED.value,
-                MultipartSessionState.FAILED.value,
+            if upload.state not in {
+                MultipartSessionState.CREATED.value,
+                MultipartSessionState.INITIATING.value,
+                MultipartSessionState.IN_PROGRESS.value,
             }:
-                raise IllegalTransitionError("Terminal multipart session cannot acquire admission.")
+                raise IllegalTransitionError(
+                    "Multipart admission is limited to upload-owned session states."
+                )
 
             now = session.scalar(select(func.clock_timestamp()))
             if not isinstance(now, datetime):
@@ -992,14 +1013,24 @@ class SqlAlchemyStore:
                 raise InvalidPartNumberError("Part is not present in the frozen PartPlan.")
             expected = Sha256Digest.parse(part.sha256)
             receipt.validate_for(expected)
+            has_any_receipt_field = (
+                part.upload_response_etag is not None
+                or part.upload_response_checksum_sha256_base64 is not None
+                or part.upload_response_received_at is not None
+                or part.uploaded_at is not None
+            )
+            existing = _upload_part_record(part).response_receipt
+            if has_any_receipt_field:
+                if existing is None:
+                    raise ContentConflictError(
+                        "Stored UploadPart receipt is structurally incomplete."
+                    )
+                if existing != receipt:
+                    raise ContentConflictError("UploadPart response receipt is immutable.")
+                return _upload_part_record(part)
             now = session.scalar(select(func.clock_timestamp()))
             if not isinstance(now, datetime):
                 raise ContentConflictError("Database time is unavailable.")
-            if part.state == UploadPartState.VERIFIED.value:
-                existing = _upload_part_record(part).response_receipt
-                if existing != receipt:
-                    raise ContentConflictError("VERIFIED Part receipt is immutable.")
-                return _upload_part_record(part)
             part.state = UploadPartState.UPLOADED.value
             part.upload_response_etag = receipt.response_etag
             part.upload_response_checksum_sha256_base64 = receipt.response_checksum_sha256_base64
@@ -1051,8 +1082,9 @@ class SqlAlchemyStore:
             if not isinstance(reconciled_at, datetime):
                 raise ContentConflictError("Database time is unavailable.")
 
-            candidates: list[UploadPartModel] = []
+            newly_resolved: list[UploadPartModel] = []
             for part in models:
+                was_verified = part.state == UploadPartState.VERIFIED.value
                 observation = observations.get(part.part_number)
                 if not _apply_provider_part_observation(part, observation, reconciled_at):
                     if part.state != UploadPartState.PENDING.value:
@@ -1060,19 +1092,19 @@ class SqlAlchemyStore:
                 else:
                     if part.state == UploadPartState.PENDING.value:
                         part.state = UploadPartState.UPLOADED.value
-                    candidates.append(part)
+                    if not was_verified:
+                        newly_resolved.append(part)
             session.flush()
-            for part in candidates:
+            for part in newly_resolved:
                 part.state = UploadPartState.VERIFIED.value
                 if part.provider_listed_at is None:
                     raise ContentConflictError("VERIFIED Part lacks provider observation time.")
                 part.verified_at = part.provider_listed_at
             session.flush()
-            resolved = [part for part in models if part.state == UploadPartState.VERIFIED.value]
             return PartReconciliationResult(
                 attribution=attribution,
-                resolved_part_count=len(resolved),
-                resolved_part_bytes=sum(part.size_bytes for part in resolved),
+                resolved_part_count=len(newly_resolved),
+                resolved_part_bytes=sum(part.size_bytes for part in newly_resolved),
             )
 
     def mark_multipart_initiation_ambiguous(
@@ -1119,10 +1151,12 @@ class SqlAlchemyStore:
     ) -> AcceptedCompletion:
         """Durably accept completion, replaying idempotency before lease fencing."""
         request_sha256 = _multipart_request_sha256(
-            "multipart-completion-accept", str(session_id), str(owner_id), str(epoch)
+            "multipart-completion-accept",
+            str(session_id),
         )
         key = str(request_id)
         with self._sessions.begin() as session:
+            _lock_multipart_request(session, "multipart-completion-accept", key)
             replay = session.get(
                 IdempotencyRecordModel,
                 {"scope": "multipart-completion-accept", "key": key},
@@ -1290,14 +1324,36 @@ class SqlAlchemyStore:
                 last_heartbeat_at=row.renewed_at,
             )
 
-    def set_completion_phase(self, claim: CompletionClaim, phase: CompletionPhase) -> None:
+    def set_completion_phase(
+        self,
+        claim: CompletionClaim,
+        phase: CompletionPhase,
+        *,
+        final_present_observed: bool = False,
+        retryable_reconciliation: bool = False,
+        transient_read_failure: bool = False,
+    ) -> None:
         """Advance durable completion work only under the current runner fence."""
         with self._sessions.begin() as session:
+            upload = session.get(UploadSessionModel, claim.session_id.value, with_for_update=True)
+            if upload is None or upload.state != MultipartSessionState.COMPLETING.value:
+                raise AdmissionLeaseLostError("Stale completion owner cannot mutate work.")
+            if upload.completion_phase is None:
+                raise ContentConflictError("Completion work has no durable phase.")
+            current_phase = CompletionPhase(upload.completion_phase)
+            require_completion_phase_transition(
+                current_phase,
+                phase,
+                final_present_observed=final_present_observed,
+                retryable_reconciliation=retryable_reconciliation,
+                transient_read_failure=transient_read_failure,
+            )
             changed = session.execute(
                 text(
                     "UPDATE upload_sessions SET completion_phase = :phase, "
                     "last_activity_at = clock_timestamp() WHERE id = :session_id "
-                    "AND state = 'COMPLETING' AND EXISTS (SELECT 1 "
+                    "AND state = 'COMPLETING' AND completion_phase = :current_phase "
+                    "AND EXISTS (SELECT 1 "
                     "FROM multipart_completion_leases lease "
                     "WHERE lease.upload_session_id = upload_sessions.id "
                     "AND lease.owner_instance_id = :owner_id AND lease.epoch = :epoch "
@@ -1305,6 +1361,7 @@ class SqlAlchemyStore:
                 ),
                 {
                     "phase": phase.value,
+                    "current_phase": current_phase.value,
                     "session_id": claim.session_id.value,
                     "owner_id": claim.lease.lease_owner_id.value,
                     "epoch": claim.lease.lease_epoch.value,
@@ -1315,8 +1372,8 @@ class SqlAlchemyStore:
 
     def recover_partial_completion(
         self, claim: CompletionClaim, evidence: PartialCompletionEvidence
-    ) -> MultipartUploadContext:
-        """Return one addressable partial MPU to upload ownership under a runner fence."""
+    ) -> CompletionRecoveryResult:
+        """Reconcile completion facts without reusing an invalidated provider attempt."""
         observations = {part.part_number: part for part in evidence.provider_parts}
         if len(observations) != len(evidence.provider_parts):
             raise ContentConflictError("Provider Part observations contain duplicate numbers.")
@@ -1351,9 +1408,29 @@ class SqlAlchemyStore:
             if set(observations) - {part.part_number for part in parts}:
                 raise InvalidPartNumberError("Provider returned an unplanned Part.")
 
+            if evidence.recovery_reason in {
+                CompletionRecoveryReason.CONDITIONAL_409,
+                CompletionRecoveryReason.MULTIPART_SESSION_NOT_FOUND,
+            }:
+                upload.final_absence_observed_at = evidence.final_absence_observed_at
+                upload.last_provider_reconciled_at = evidence.provider_reconciled_at
+                upload.last_completion_result = evidence.persisted_completion_result
+                upload.provider_attempt_invalidated_at = now
+                upload.failure_code = "PROVIDER_ATTEMPT_INVALIDATED"
+                upload.state = MultipartSessionState.FAILED.value
+                upload.completed_at = now
+                upload.last_activity_at = now
+                lease.renewed_at = now
+                lease.expires_at = now
+                session.flush()
+                return CompletionRecoveryResult(
+                    action=CompletionRecoveryAction.START_NEW_GENERATION,
+                    context=self._load_multipart_context(session, upload),
+                )
+
             upload.final_absence_observed_at = evidence.final_absence_observed_at
             upload.last_provider_reconciled_at = evidence.provider_reconciled_at
-            upload.last_completion_result = evidence.completion_result
+            upload.last_completion_result = evidence.persisted_completion_result
             session.flush()
             candidates: list[UploadPartModel] = []
             for part in parts:
@@ -1372,6 +1449,23 @@ class SqlAlchemyStore:
                 part.verified_at = evidence.provider_reconciled_at
             session.flush()
 
+            all_parts_verified = all(part.state == UploadPartState.VERIFIED.value for part in parts)
+            if evidence.recovery_reason is CompletionRecoveryReason.PARTS_READY:
+                if not all_parts_verified:
+                    raise ContentConflictError(
+                        "PARTS_READY recovery requires every planned Part to match."
+                    )
+                return CompletionRecoveryResult(
+                    action=CompletionRecoveryAction.RETRY_COMPLETION,
+                    context=self._load_multipart_context(session, upload),
+                )
+            if evidence.recovery_reason is not CompletionRecoveryReason.PARTS_PARTIAL:
+                raise ContentConflictError("Unsupported completion recovery reason.")
+            if all_parts_verified:
+                raise ContentConflictError(
+                    "PARTS_PARTIAL recovery requires at least one unresolved Part."
+                )
+
             upload.state = MultipartSessionState.IN_PROGRESS.value
             upload.completion_reason = None
             upload.completion_phase = None
@@ -1379,7 +1473,10 @@ class SqlAlchemyStore:
             lease.renewed_at = now
             lease.expires_at = now
             session.flush()
-            return self._load_multipart_context(session, upload)
+            return CompletionRecoveryResult(
+                action=CompletionRecoveryAction.RESUME_PART_UPLOAD,
+                context=self._load_multipart_context(session, upload),
+            )
 
     def record_verified_completion(
         self, claim: CompletionClaim, evidence: VerificationEvidence
@@ -1406,6 +1503,10 @@ class SqlAlchemyStore:
                 raise AdmissionLeaseLostError(
                     "Stale completion owner cannot publish verification evidence."
                 )
+            if upload.completion_phase != CompletionPhase.FINAL_VERIFICATION.value:
+                raise IllegalTransitionError(
+                    "Multipart publication requires completion phase FINAL_VERIFICATION."
+                )
             blob = session.get(BlobModel, upload.blob_id, with_for_update=True)
             if blob is None:
                 raise ContentConflictError("Multipart Blob is unavailable.")
@@ -1413,7 +1514,6 @@ class SqlAlchemyStore:
             if blob.state != BlobState.UPLOADING.value:
                 raise IllegalTransitionError("Only an UPLOADING Blob can be published.")
 
-            upload.completion_phase = CompletionPhase.FINAL_VERIFICATION.value
             upload.verification_method = evidence.verification_method.value
             upload.observed_sha256 = evidence.observed_sha256.value
             upload.observed_size_bytes = evidence.observed_size_bytes
@@ -1437,6 +1537,7 @@ class SqlAlchemyStore:
             return self._load_multipart_context(session, upload)
 
     def _load_upload_context(self, session: Session, upload: UploadSessionModel) -> UploadContext:
+        _require_single_put_session(upload)
         blob = session.get(BlobModel, upload.blob_id)
         version = session.get(DatasetVersionModel, upload.initiating_version_id)
         if blob is None or version is None:
@@ -1573,6 +1674,7 @@ def _blob_record(model: BlobModel) -> BlobRecord:
 
 
 def _upload_session_record(model: UploadSessionModel) -> UploadSessionRecord:
+    _require_single_put_session(model)
     return UploadSessionRecord(
         id=model.id,
         blob_id=model.blob_id,
@@ -1595,6 +1697,13 @@ def _upload_context(
     )
 
 
+def _require_single_put_session(model: UploadSessionModel) -> None:
+    if model.strategy != "SINGLE_PUT":
+        raise IllegalTransitionError(
+            "M1 single-PUT operation cannot use a MULTIPART UploadSession."
+        )
+
+
 def _multipart_request_sha256(scope: str, *values: str) -> str:
     payload = json.dumps(
         {"scope": scope, "values": list(values)},
@@ -1602,6 +1711,20 @@ def _multipart_request_sha256(scope: str, *values: str) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _lock_multipart_request(session: Session, scope: str, key: str) -> None:
+    """Serialize one semantic request identity until its transaction ends."""
+    identity = f"{scope}\0{key}".encode()
+    advisory_key = int.from_bytes(
+        hashlib.sha256(identity).digest()[:8],
+        "big",
+        signed=True,
+    )
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:advisory_key)"),
+        {"advisory_key": advisory_key},
+    )
 
 
 def _admission_lease_record(model: MultipartAdmissionLeaseModel) -> AdmissionLeaseRecord:

@@ -40,6 +40,7 @@ from robolake.domain.multipart import (
     CompletionLeaseEpoch,
     CompletionLeaseOwnerId,
     CompletionPhase,
+    CompletionRecoveryReason,
     MultipartInvocationId,
     MultipartRequestId,
     MultipartSessionGeneration,
@@ -57,6 +58,7 @@ from robolake.domain.multipart import (
     require_completion_phase_transition,
     require_multipart_session_transition,
     require_upload_part_transition,
+    select_multipart_part_size,
     sha256_base64_to_digest,
     sha256_digest_to_base64,
 )
@@ -153,32 +155,40 @@ def test_exact_ten_thousand_part_boundary_keeps_base_part_size() -> None:
 
 
 def _compact_plan() -> PartPlan:
+    part_size = BASE_PART_BYTES
+    part_count = 75
     return PartPlan.build(
         schema_version=PART_PLAN_SCHEMA_VERSION,
-        blob_size_bytes=12_582_912,
-        part_size_bytes=6_291_456,
-        parts=(
-            PartDefinition(1, 0, 6_291_456, Sha256Digest("1" * 64)),
-            PartDefinition(2, 6_291_456, 6_291_456, Sha256Digest("2" * 64)),
+        blob_size_bytes=part_size * part_count,
+        part_size_bytes=part_size,
+        parts=tuple(
+            PartDefinition(
+                part_number,
+                (part_number - 1) * part_size,
+                part_size,
+                Sha256Digest(f"{part_number:064x}"),
+            )
+            for part_number in range(1, part_count + 1)
         ),
     )
 
 
 def test_part_plan_canonical_bytes_match_the_accepted_golden_vector() -> None:
-    expected = (
-        b'{"schema_version":1,"blob_size_bytes":12582912,"part_size_bytes":6291456,'
-        b'"part_count":2,"parts":[{"part_number":1,"offset_bytes":0,'
-        b'"size_bytes":6291456,"sha256":"1111111111111111111111111111111111111111111111111111111111111111"},'
-        b'{"part_number":2,"offset_bytes":6291456,"size_bytes":6291456,'
-        b'"sha256":"2222222222222222222222222222222222222222222222222222222222222222"}]}'
-    )
-
     actual = canonical_part_plan_bytes(_compact_plan())
 
-    assert actual == expected
+    assert actual.startswith(
+        b'{"schema_version":1,"blob_size_bytes":5033164800,'
+        b'"part_size_bytes":67108864,"part_count":75,"parts":['
+    )
+    assert actual.endswith(
+        b'{"part_number":75,"offset_bytes":4966055936,"size_bytes":67108864,'
+        b'"sha256":"000000000000000000000000000000000000000000000000000000000000004b"}]}'
+    )
     assert not actual.endswith(b"\n")
-    assert part_plan_sha256(_compact_plan()).value == hashlib.sha256(expected).hexdigest()
-    assert parse_canonical_part_plan(expected) == _compact_plan()
+    assert hashlib.sha256(actual).hexdigest() == (
+        "3163c32a09894e58e27903bc61142c53208a31ee600acded1a65dc5f7b8071f1"
+    )
+    assert parse_canonical_part_plan(actual) == _compact_plan()
 
 
 def test_part_plan_build_is_independent_of_in_memory_part_order() -> None:
@@ -217,11 +227,15 @@ def test_hashed_part_plan_rejects_a_digest_for_different_canonical_bytes() -> No
                     offset_bytes=plan.parts[1].offset_bytes + 1,
                     size_bytes=plan.parts[1].size_bytes - 1,
                 ),
+                *plan.parts[2:],
             ),
         ),
         lambda plan: replace(
             plan,
-            parts=(replace(plan.parts[0], expected_sha256=Sha256Digest("3" * 64)), plan.parts[1]),
+            parts=(
+                replace(plan.parts[0], expected_sha256=Sha256Digest("3" * 64)),
+                *plan.parts[1:],
+            ),
         ),
     ],
 )
@@ -247,9 +261,11 @@ def test_every_part_plan_identity_field_changes_or_invalidates_hash(mutation: ob
         canonical_part_plan_bytes(_compact_plan()).replace(
             b'"schema_version":1', b'"schema_version":1.0'
         ),
-        canonical_part_plan_bytes(_compact_plan()).replace(b'"part_count":2', b'"part_count":true'),
+        canonical_part_plan_bytes(_compact_plan()).replace(
+            b'"part_count":75', b'"part_count":true'
+        ),
         canonical_part_plan_bytes(_compact_plan()).replace(b'"parts"', b'"unknown":0,"parts"'),
-        canonical_part_plan_bytes(_compact_plan()).replace(b'"sha256":"1', b'"sha256":"A', 1),
+        canonical_part_plan_bytes(_compact_plan()).replace(b'"sha256":"0', b'"sha256":"A', 1),
         canonical_part_plan_bytes(_compact_plan()).replace(
             b'{"schema_version":1', b'{"schema_version":1,"schema_version":1', 1
         ),
@@ -258,6 +274,85 @@ def test_every_part_plan_identity_field_changes_or_invalidates_hash(mutation: ob
 def test_part_plan_parser_rejects_noncanonical_or_invalid_json(data: bytes) -> None:
     with pytest.raises(ManifestMismatchError):
         parse_canonical_part_plan(data)
+
+
+def test_part_plan_rejects_caller_selected_alternative_segmentation() -> None:
+    blob_size = 5_000_000_001
+    alternative_part_size = 100_000_000
+    part_count = (blob_size + alternative_part_size - 1) // alternative_part_size
+
+    with pytest.raises(ManifestMismatchError):
+        PartPlan.build(
+            schema_version=PART_PLAN_SCHEMA_VERSION,
+            blob_size_bytes=blob_size,
+            part_size_bytes=alternative_part_size,
+            parts=(
+                PartDefinition(
+                    part_number,
+                    (part_number - 1) * alternative_part_size,
+                    min(
+                        alternative_part_size,
+                        blob_size - (part_number - 1) * alternative_part_size,
+                    ),
+                    Sha256Digest("ab" * 32),
+                )
+                for part_number in range(1, part_count + 1)
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", True),
+        ("blob_size_bytes", True),
+        ("part_size_bytes", True),
+        ("part_number", True),
+        ("offset_bytes", False),
+        ("size_bytes", True),
+    ],
+)
+def test_part_plan_rejects_bool_for_every_protocol_integer_field(field: str, value: bool) -> None:
+    plan = _compact_plan()
+
+    with pytest.raises(ManifestMismatchError):
+        if field in {"schema_version", "blob_size_bytes", "part_size_bytes"}:
+            replace(plan, **{field: value})
+        else:
+            replace(plan.parts[0], **{field: value})
+
+
+@pytest.mark.parametrize("size", [1, BASE_PART_BYTES, 5_000_000_000])
+def test_checksum_complete_part_plan_rejects_non_m2_blob_size(size: int) -> None:
+    with pytest.raises((ManifestMismatchError, UnsupportedFileSizeError)):
+        PartPlan.build(
+            schema_version=PART_PLAN_SCHEMA_VERSION,
+            blob_size_bytes=size,
+            part_size_bytes=BASE_PART_BYTES,
+            parts=(PartDefinition(1, 0, size, Sha256Digest("ab" * 32)),),
+        )
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        (5_000_000_001, BASE_PART_BYTES),
+        (BASE_PART_BYTES * MAX_PARTS, BASE_PART_BYTES),
+        (BASE_PART_BYTES * MAX_PARTS + 1, BASE_PART_BYTES * 2),
+        (1024**4, BASE_PART_BYTES * 2),
+        (MAX_MULTIPART_BLOB_BYTES, BASE_PART_BYTES * 8),
+    ],
+)
+def test_select_multipart_part_size_is_the_authoritative_protocol_function(
+    size: int, expected: int
+) -> None:
+    assert select_multipart_part_size(size) == expected
+
+
+@pytest.mark.parametrize("size", [True, 5_000_000_000, MAX_MULTIPART_BLOB_BYTES + 1])
+def test_select_multipart_part_size_rejects_non_m2_sizes(size: int) -> None:
+    with pytest.raises(UnsupportedFileSizeError):
+        select_multipart_part_size(size)
 
 
 def test_typed_identities_do_not_alias_each_other() -> None:
@@ -345,21 +440,44 @@ def test_upload_part_state_has_no_issued_or_failed_state_and_resets_are_guarded(
 def test_completion_phase_tracks_long_work_without_blob_state() -> None:
     assert require_completion_phase_transition(CompletionPhase.PENDING, CompletionPhase.ASSEMBLING)
     assert require_completion_phase_transition(
-        CompletionPhase.PENDING, CompletionPhase.FINAL_PRESENT
-    )
-    assert require_completion_phase_transition(
         CompletionPhase.ASSEMBLING, CompletionPhase.FINAL_PRESENT
     )
     assert require_completion_phase_transition(
         CompletionPhase.FINAL_PRESENT, CompletionPhase.FINAL_VERIFICATION
     )
-    assert require_completion_phase_transition(
-        CompletionPhase.FINAL_VERIFICATION, CompletionPhase.FINAL_PRESENT
-    )
-    with pytest.raises(IllegalTransitionError):
+    for current, target in (
+        (CompletionPhase.PENDING, CompletionPhase.FINAL_PRESENT),
+        (CompletionPhase.PENDING, CompletionPhase.FINAL_VERIFICATION),
+        (CompletionPhase.ASSEMBLING, CompletionPhase.PENDING),
+        (CompletionPhase.FINAL_VERIFICATION, CompletionPhase.FINAL_PRESENT),
+        (CompletionPhase.FINAL_VERIFICATION, CompletionPhase.ASSEMBLING),
+    ):
+        with pytest.raises(IllegalTransitionError):
+            require_completion_phase_transition(current, target)
+    assert (
         require_completion_phase_transition(
-            CompletionPhase.FINAL_VERIFICATION, CompletionPhase.ASSEMBLING
+            CompletionPhase.PENDING,
+            CompletionPhase.FINAL_PRESENT,
+            final_present_observed=True,
         )
+        is CompletionPhase.FINAL_PRESENT
+    )
+    assert (
+        require_completion_phase_transition(
+            CompletionPhase.ASSEMBLING,
+            CompletionPhase.PENDING,
+            retryable_reconciliation=True,
+        )
+        is CompletionPhase.PENDING
+    )
+    assert (
+        require_completion_phase_transition(
+            CompletionPhase.FINAL_VERIFICATION,
+            CompletionPhase.FINAL_PRESENT,
+            transient_read_failure=True,
+        )
+        is CompletionPhase.FINAL_PRESENT
+    )
 
 
 def test_completed_part_receipt_normalizes_provider_sha256() -> None:
@@ -374,6 +492,31 @@ def test_completed_part_receipt_normalizes_provider_sha256() -> None:
     assert receipt.response_checksum_sha256_base64 == "A" * 43 + "="
     assert sha256_base64_to_digest(receipt.response_checksum_sha256_base64) == expected
     assert receipt.validate_for(expected) is receipt
+
+
+@pytest.mark.parametrize(
+    ("reason", "provider_result"),
+    [
+        (CompletionRecoveryReason.PARTS_PARTIAL, "CONFLICT_409"),
+        (CompletionRecoveryReason.PARTS_READY, "NO_SUCH_UPLOAD"),
+        (CompletionRecoveryReason.CONDITIONAL_409, "AMBIGUOUS"),
+        (CompletionRecoveryReason.MULTIPART_SESSION_NOT_FOUND, "EMBEDDED_ERROR"),
+    ],
+)
+def test_completion_recovery_reason_rejects_contradictory_provider_result(
+    reason: CompletionRecoveryReason,
+    provider_result: str,
+) -> None:
+    now = datetime.now(UTC)
+
+    with pytest.raises(ContentConflictError):
+        PartialCompletionEvidence(
+            recovery_reason=reason,
+            final_absence_observed_at=now,
+            provider_reconciled_at=now,
+            provider_parts=(),
+            completion_result=provider_result,
+        )
 
 
 @pytest.mark.parametrize("checksum", ["", "not-base64", "AA==", "A" * 44])
@@ -429,11 +572,27 @@ def test_partial_completion_evidence_rejects_409_and_naive_times() -> None:
         checksum_sha256_base64=Sha256Digest("00" * 32).checksum_base64,
     )
 
-    assert PartialCompletionEvidence(now, now, (observation,)).provider_parts == (observation,)
+    assert PartialCompletionEvidence(
+        CompletionRecoveryReason.PARTS_PARTIAL,
+        now,
+        now,
+        (observation,),
+    ).provider_parts == (observation,)
     with pytest.raises(ContentConflictError):
-        PartialCompletionEvidence(now, now, (), completion_result="CONFLICT_409")
+        PartialCompletionEvidence(
+            CompletionRecoveryReason.PARTS_PARTIAL,
+            now,
+            now,
+            (),
+            completion_result="CONFLICT_409",
+        )
     with pytest.raises(ContentConflictError):
-        PartialCompletionEvidence(datetime.now(), now, ())
+        PartialCompletionEvidence(
+            CompletionRecoveryReason.PARTS_PARTIAL,
+            datetime.now(),
+            now,
+            (),
+        )
 
 
 def test_lease_records_require_aware_time_and_monotonic_epochs() -> None:
