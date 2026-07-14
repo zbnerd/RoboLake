@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID
@@ -10,18 +10,25 @@ from uuid import UUID
 from robolake.application.contracts import (
     DownloadCapability,
     DownloadItem,
+    FinalObjectInspection,
+    ListedProviderPart,
     LocalFileRef,
+    MultipartAbortResult,
+    MultipartCompletionResult,
     ObjectInfo,
     PreparedDownload,
     PresignedRequest,
+    ProviderUploadId,
     PutReceipt,
     ScannedDataset,
     UploadContext,
+    UploadPartCapability,
     UploadPreparation,
 )
 from robolake.domain.identifiers import DatasetName, DatasetReference, Sha256Digest
 from robolake.domain.lifecycle import FailureCode
 from robolake.domain.manifest import Manifest, ManifestEntry
+from robolake.domain.multipart import CompletedPartReceipt
 from robolake.domain.records import DatasetRecord, VersionRecord, VersionStatus
 
 
@@ -95,6 +102,39 @@ class ObjectStorePort(Protocol):
     ) -> PresignedRequest: ...
 
     def presign_get(self, object_key: str, expires_seconds: int) -> PresignedRequest: ...
+
+
+class MultipartObjectStorePort(Protocol):
+    """Provider-neutral M2 multipart control boundary."""
+
+    def create_multipart(self, object_key: str) -> ProviderUploadId: ...
+
+    def presign_upload_part(
+        self,
+        object_key: str,
+        upload_id: ProviderUploadId,
+        part_number: int,
+        size_bytes: int,
+        checksum_sha256_base64: str,
+        expires_seconds: int,
+    ) -> UploadPartCapability: ...
+
+    def list_parts(
+        self, object_key: str, upload_id: ProviderUploadId
+    ) -> tuple[ListedProviderPart, ...]: ...
+
+    def complete_multipart(
+        self,
+        object_key: str,
+        upload_id: ProviderUploadId,
+        parts: Sequence[CompletedPartReceipt],
+    ) -> MultipartCompletionResult: ...
+
+    def abort_multipart(
+        self, object_key: str, upload_id: ProviderUploadId
+    ) -> MultipartAbortResult: ...
+
+    def inspect_final_object(self, object_key: str) -> FinalObjectInspection: ...
 
 
 class ScannerPort(Protocol):
