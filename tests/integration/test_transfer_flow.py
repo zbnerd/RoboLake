@@ -215,7 +215,16 @@ def test_interrupted_push_resumes_without_reuploading_available_blob(
         _push(flow_services, source, name, interrupted)
 
     available_before = flow_services.database.execute(
-        text("SELECT count(*) FROM blobs WHERE state = 'AVAILABLE'")
+        text(
+            "SELECT count(DISTINCT blobs.id) "
+            "FROM blobs "
+            "JOIN dataset_entries ON dataset_entries.blob_id = blobs.id "
+            "JOIN dataset_versions "
+            "ON dataset_versions.id = dataset_entries.dataset_version_id "
+            "JOIN datasets ON datasets.id = dataset_versions.dataset_id "
+            "WHERE datasets.name = :dataset_name AND blobs.state = 'AVAILABLE'"
+        ),
+        {"dataset_name": name},
     ).scalar_one()
     counting = CountingTransfer(flow_services.bytes)
     resumed = _push(flow_services, source, name, counting)

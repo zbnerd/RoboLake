@@ -1,4 +1,4 @@
-"""Integration behavior for the M1 Alembic migration."""
+"""Integration behavior for the current Alembic migration chain."""
 
 import os
 import subprocess
@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, inspect, text
 pytestmark = pytest.mark.integration
 
 
-def test_m1_migration_creates_registry_schema_at_head(migrated_database_url: str) -> None:
+def test_migration_creates_registry_schema_at_head(migrated_database_url: str) -> None:
     engine = create_engine(migrated_database_url)
     try:
         inspector = inspect(engine)
@@ -20,20 +20,23 @@ def test_m1_migration_creates_registry_schema_at_head(migrated_database_url: str
             "blobs",
             "dataset_entries",
             "upload_sessions",
+            "upload_parts",
+            "multipart_admission_leases",
+            "multipart_completion_leases",
             "idempotency_records",
         }.issubset(inspector.get_table_names())
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == ("20260711_0002")
+            ).scalar_one() == ("20260714_0003")
     finally:
         engine.dispose()
 
 
-def test_m1_migration_downgrades_cleanly_and_reapplies(
-    migrated_database_url: str, repository_root: Path
+def test_migration_chain_downgrades_cleanly_and_reapplies(
+    isolated_migrated_database_url: str, repository_root: Path
 ) -> None:
-    environment = {**os.environ, "ROBOLAKE_DATABASE_URL": migrated_database_url}
+    environment = {**os.environ, "ROBOLAKE_DATABASE_URL": isolated_migrated_database_url}
     command = ["uv", "run", "alembic"]
     subprocess.run(
         [*command, "downgrade", "20260710_0001"],
@@ -44,7 +47,7 @@ def test_m1_migration_downgrades_cleanly_and_reapplies(
         text=True,
     )
     try:
-        engine = create_engine(migrated_database_url)
+        engine = create_engine(isolated_migrated_database_url)
         try:
             assert not {
                 "datasets",

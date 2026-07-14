@@ -187,11 +187,13 @@ def test_minio_get_started_before_expiry_finishes_but_new_request_is_rejected(
     digest, key = _identity(data)
     put = live_object_store.presign_put(key, len(data), digest.checksum_base64, 60)
     assert httpx.put(put.url, content=data, headers=put.headers, timeout=10).status_code == 200
-    get = live_object_store.presign_get(key, 1)
+    # SigV4 signing timestamps have one-second precision. A one-second TTL can
+    # therefore have almost no usable lifetime when generated near a boundary.
+    get = live_object_store.presign_get(key, 3)
 
     with httpx.stream("GET", get.url, timeout=10) as response:
         assert response.status_code == 200
-        time.sleep(2)
+        time.sleep(4)
         received = b"".join(response.iter_bytes())
 
     assert received == data
