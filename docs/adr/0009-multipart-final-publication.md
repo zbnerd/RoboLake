@@ -22,40 +22,49 @@ Provider probes showed:
 ## Decision
 
 Upload multipart directly to the deterministic final Blob key. The complete endpoint never holds a
-control request open for provider completion or final verification. It validates the current upload
-fence and accepts either `PARTS_READY` (every response receipt is provider-verified) or
-`FINAL_PRESENT` (a fresh deterministic-key observation needs adoption verification). It atomically
-records `COMPLETING`, releases that lease, and returns HTTP 202. PostgreSQL `COMPLETING` rows are the
-durable work registry. `FINAL_PRESENT` never marks incomplete parts VERIFIED or calls Complete with
-an incomplete receipt set.
+control request open for provider completion or final verification. It first replays an immutable
+matching completion idempotency record, before admission fencing; mismatch returns
+`IDEMPOTENCY_CONFLICT`. Only first execution validates the current upload fence and accepts either
+`PARTS_READY` (every response receipt is provider-verified) or `FINAL_PRESENT` (a fresh
+deterministic-key observation needs adoption verification). One transaction records
+`COMPLETING`/`PENDING`, creates pending work, releases that lease, and persists the exact safe HTTP
+202 response. A concurrent unique-key loser replays the winner. `FINAL_PRESENT` never marks
+incomplete parts VERIFIED or calls Complete with an incomplete receipt set.
 
 A bounded server runner from the same modular-monolith artifact claims work through PostgreSQL
 `FOR UPDATE SKIP LOCKED` or equivalent, under a separate completion owner UUID, monotonic epoch, and
 expiring lease. Default concurrency is 2 (hard maximum 8), with 120-second TTL and 30-second
-heartbeat. It submits
-`CompleteMultipartUpload(If-None-Match: *)` using the ordered ETags captured from successful
-UploadPart responses, then performs deterministic-key reconciliation and full verification. Its
+heartbeat. It submits `CompleteMultipartUpload(If-None-Match: *)` using ordered
+`CompletedPartReceipt` values containing PartNumber plus the ETag and Base64 `ChecksumSHA256`
+captured from successful UploadPart responses, then performs deterministic-key reconciliation and full verification. Its
 heartbeat runs in independent short transactions throughout the long provider calls. No Kafka,
 Celery, external queue, or long database transaction is introduced. A 200, 412, 409, timeout, or
 lost response is not sufficient to mark success.
 
-ETags are opaque ordered completion receipts, not identifiers or integrity proof. Different part numbers may have
-identical ETags, provider checksums, and expected SHA-256 values when their bytes are identical;
-completion requires one stored UploadPart response receipt per expected part number but never receipt
-uniqueness. ListParts verifies that the current provider part matches the stored response
-ETag/checksum receipt, size, and checksum; it is not the source of the Complete receipt list.
-Supported providers must return the requested SHA-256 in the UploadPart response. If the response
-was lost, RoboLake re-uploads that exact part and records the replacement response before completion.
+ETags are opaque fields within ordered completion receipts, not identifiers or integrity proof.
+Different part numbers may have identical ETags, provider checksums, and expected SHA-256 values when
+their bytes are identical; completion requires one stored UploadPart response receipt per expected
+part number but never receipt uniqueness. ListParts verifies that the current provider part matches
+the stored response ETag/checksum receipt, size, and checksum; it is not the source of the Complete
+receipt list.
+Supported providers must return the requested SHA-256 in the UploadPart response. Expected digest
+hex and provider Base64 must normalize to the same 32 raw bytes. AWS's general `CompletedPart`
+checksum field is optional; RoboLake makes it mandatory in this checksum-enabled SHA-256 profile. If
+the response was lost, RoboLake re-uploads that exact part and records both replacement response
+fields before completion.
 
 HTTP status 200 alone is never completion proof: CompleteMultipartUpload can embed an error after
 sending initial 200 headers. The SDK/provider adapter must parse and surface the final body outcome;
 an embedded error leaves the session non-terminal and triggers deterministic reconciliation.
 
-For every newly visible final multipart object whose Blob is not already `AVAILABLE`, stream the
-entire object and compare its SHA-256/size with immutable Blob identity. Only an exact match permits
-`Blob -> AVAILABLE` and session `COMPLETED`. A matching concurrent object is adopted. A mismatch
-returns `STORED_OBJECT_MISMATCH` and requires operator intervention; it is never overwritten or
-automatically deleted.
+For every newly visible final multipart object whose Blob is not already `AVAILABLE`, keep the Blob
+`UPLOADING` while `completion_phase` advances through `FINAL_PRESENT` and `FINAL_VERIFICATION`.
+Stream the entire object and compare its SHA-256/size with immutable Blob identity. Only after the
+complete digest exists may one short fenced transaction record evidence, transition Blob
+`UPLOADING -> VERIFYING -> AVAILABLE`, and mark the session `COMPLETED`. A matching concurrent object
+is adopted. A proven mismatch performs `UPLOADING -> VERIFYING -> FAILED` with terminal session
+failure and `STORED_OBJECT_MISMATCH`/operator intervention. Transient provider/read failure leaves
+the Blob `UPLOADING`; no final object is overwritten or automatically deleted.
 
 The application records immutable `FULL_STREAM_SHA256` evidence: observed digest, observed size,
 verification-read bytes, completion time, and verifier implementation. PostgreSQL can enforce that

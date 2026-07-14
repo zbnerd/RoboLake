@@ -70,6 +70,7 @@ WHERE b.sha256 = :blob_sha
 ORDER BY d.name, dv.version_number, de.relative_path;
 
 SELECT us.id, us.session_generation, us.strategy, us.state, us.failure_code,
+       us.completion_reason, us.completion_phase,
        us.verification_method, us.observed_sha256, us.observed_size_bytes,
        us.verification_read_bytes, us.verification_completed_at,
        us.created_at, us.last_activity_at, us.completed_at
@@ -108,6 +109,12 @@ Stop immediately if the Blob row is absent, `state = 'AVAILABLE'`, `ready_refere
 `IN_PROGRESS`, `COMPLETING`, or `ABORTING`, or an upload/completion lease is unexpired. An expired lease does not make the
 session safe to delete; reacquire it through the approved workflow and resolve/abort the persistent
 session first. Do not edit these rows manually, then restart this inspection from step 1.
+
+During normal M2 verification, Blob remains `UPLOADING` while the session reports `COMPLETING` and
+`completion_phase=FINAL_VERIFICATION`. `VERIFYING` is not a long-running read state. A proven mismatch
+is recorded by the application in one short fenced transaction that performs Blob
+`UPLOADING -> VERIFYING -> FAILED` and terminalizes the session. Never infer that a merely
+`UPLOADING` Blob is poisoned while completion work or a retryable provider read is still active.
 
 ## 4. Inspect and stream-verify provider bytes
 

@@ -14,8 +14,8 @@ configuration; correcting a Proposed ADR in its original review does not require
 | [0005](adr/0005-modular-monolith.md) | Keep domain/application framework-free inside one Python deployable and shared CLI package. | Accepted |
 | [0006](adr/0006-m1-conditional-single-put-slice.md) | Use create-only conditional PUT, whole-Blob resume, reconciliation, and one-at-a-time pull capability. | Accepted |
 | [0007](adr/0007-failed-publication-and-manual-repair.md) | Detect, report, and stop on poisoned objects; do not guess, overwrite, delete, or auto-repair. | Accepted |
-| [0008](adr/0008-multipart-session-model.md) | Separate request/invocation/generation identity, freeze canonical part plans, and fence upload/completion ownership. | Proposed |
-| [0009](adr/0009-multipart-final-publication.md) | Accept async completion, publish directly create-only, and require full-byte SHA-256 before AVAILABLE. | Proposed |
+| [0008](adr/0008-multipart-session-model.md) | Freeze part plans and complete response receipts; separate resumable sessions from fenced upload/completion ownership. | Proposed |
+| [0009](adr/0009-multipart-final-publication.md) | Replay acceptance before fencing, publish directly create-only, and require full-byte SHA-256 before the short availability transaction. | Proposed |
 | [0010](adr/0010-multipart-reconciliation.md) | Reconcile response receipts, provider facts, initiation/completion ambiguity, and lease takeover deterministically. | Proposed |
 
 ## Reading order

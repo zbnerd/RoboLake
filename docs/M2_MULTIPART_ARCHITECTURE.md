@@ -193,14 +193,17 @@ Provider initiation has an explicit durable boundary. A new generation begins `C
 provider call has occurred and cancellation is local. The API commits `INITIATING` before
 CreateMultipartUpload and moves to `IN_PROGRESS` only after the returned upload ID is durable. If
 the response or DB commit is ambiguous, that generation becomes terminal with
-`MULTIPART_INITIATION_AMBIGUOUS`; a new request creates the next generation. If the process still
-knows the returned ID it may best-effort abort it, but unknown residue is never guessed/adopted and
+`MULTIPART_INITIATION_AMBIGUOUS` and admission ends in the same current-owner fenced transaction; a
+new request creates the next generation. If the process still knows the returned ID it may
+best-effort abort it, but unknown residue is never guessed/adopted and
 remains bounded by provider lifecycle policy. Abort during `INITIATING` returns retryable
 `MULTIPART_INITIATION_IN_PROGRESS` because `ABORTING` requires a durable upload ID.
 
 If the initiating API process disappears, upload-lease expiry permits a new fenced owner to mark the
 generation `MULTIPART_INITIATION_AMBIGUOUS`; it must not repeat Create inside that generation. The
-CLI then uses a fresh create/resolve request UUID for the next generation.
+terminal transition and release of that generation's admission lease occur in the same fenced
+transaction. The CLI then uses a fresh create/resolve request UUID for the next generation. If the
+process dies before that transaction, lease TTL is the bounded capacity-reclamation fallback.
 
 The API issues a rolling window no larger than the configured concurrency (default 4, maximum 16).
 Issuing all missing parts is rejected because thousands of bearer URLs could expire unused or leak.
@@ -212,14 +215,31 @@ range reader before requesting the URL and begins immediately. Replay can only r
 with the same length and digest, which is safe while the MPU is incomplete. Provider error bodies
 are not parsed by the CLI; it reports the part number to the API and requests reconciliation.
 
-When UploadPart succeeds unambiguously, the CLI returns its opaque response ETag and provider
-SHA-256 response checksum to the API. The adapter normalizes the provider's checksum encoding to a
-lowercase hexadecimal digest. The API stores both receipt fields but advances to `VERIFIED` only
-after paginated ListParts matches part number, size, expected checksum, receipt checksum, and receipt
-ETag. A missing response checksum fails the M2 provider contract. AWS explicitly instructs multipart
-clients to retain UploadPart response ETags and not use a listing as the Complete request source.
-Therefore a matching provider part with no durable response receipt is safely re-uploaded to obtain
-one; ListParts alone never manufactures a completion receipt.
+When UploadPart succeeds unambiguously, the CLI returns a complete provider receipt:
+
+```text
+CompletedPartReceipt = {
+  part_number,
+  response_etag,
+  response_checksum_sha256_base64
+}
+```
+
+Both opaque response fields must come from that successful UploadPart response. The canonical
+expected part digest remains 64 lowercase hexadecimal characters. The provider checksum is
+canonical padded RFC 4648 Base64 of the same 32 raw digest bytes:
+`base64.b64encode(bytes.fromhex(expected_sha256)).decode("ascii")`. Decoding must yield exactly 32
+bytes and the normalized bytes must equal the expected digest. A missing or non-matching response
+checksum fails the RoboLake M2 provider contract.
+
+The API stores the complete receipt but advances to `VERIFIED` only after paginated ListParts
+matches part number, size, expected checksum, response checksum, and response ETag. AWS explicitly
+instructs multipart clients to retain UploadPart response ETags and not use a listing as the Complete
+request source. Therefore a matching provider part with no durable response receipt is safely
+re-uploaded with the exact same number, range, length, bytes, and checksum; ListParts alone never
+manufactures a completion receipt. AWS models checksum fields as optional in the general
+`CompletedPart` API. Requiring both ETag and `ChecksumSHA256` is RoboLake's deliberately stricter,
+checksum-enabled SHA-256 multipart profile, not a claim that AWS universally requires the checksum.
 
 When one worker fails, the CLI stops scheduling new parts, lets already-started requests settle,
 then reconciles the complete window. Progress advances only for receipt-backed, provider-verified
@@ -233,25 +253,35 @@ is renewed every 30 seconds. The global default cap of 64 counts only unexpired 
 expired lease can be atomically taken over for the same session with a higher epoch, leaving the
 provider upload and parts untouched.
 
-Capability issuance, reconcile writes, receipt confirmation, initiation, abort, completion
+Capability issuance, reconcile writes, receipt confirmation, initiation, abort, first completion
 acceptance, and their post-provider DB commits require the current `(owner_id, epoch)` and an
-unexpired lease. Repository mutations use one atomic SQL predicate over session, owner, epoch, and
+unexpired lease. A committed completion replay is handled before this fence. Repository mutations
+use one atomic SQL predicate over session, owner, epoch, and
 database-time expiry; zero affected rows maps to `ADMISSION_LEASE_LOST`. Constraints protect
 structural facts but do not independently prove caller ownership. A part URL issued earlier may
 still write only its signed bytes; the current owner later reconciles that provider fact.
 
 ## 8. Integrity and final publication
 
-The completion endpoint is short and idempotent:
+The completion endpoint is short and idempotent. It first looks up the completion operation by
+scope and `request_id`, before inspecting the admission lease or session. A matching canonical
+request hash returns the exact stored response without requiring a current lease or repeating any
+mutation. A different hash returns `IDEMPOTENCY_CONFLICT` without inspecting the session.
 
-1. validate the current upload admission fence;
-2. check the deterministic final key first;
-3. if final is present, accept reason `FINAL_PRESENT`; otherwise reconcile every paginated provider
-   part and require receipt-backed matches `1..N` for reason `PARTS_READY`;
-4. atomically set `COMPLETING`, freeze the reason for that accepted work item, record pending work,
-   release the upload lease, and
-   return HTTP 202; and
-5. let repeated calls/status return the same durable state rather than start duplicate work.
+Only the first execution validates the current upload admission fence, checks the deterministic
+final key, and either accepts reason `FINAL_PRESENT` or reconciles all paginated parts and requires
+receipt-backed matches `1..N` for reason `PARTS_READY`. One database transaction then:
+
+1. transitions the session to `COMPLETING` with `completion_phase=PENDING`;
+2. creates the pending completion operation;
+3. releases the upload admission lease; and
+4. stores the immutable canonical HTTP 202 response in the idempotency record.
+
+The transaction commits before the response is returned. A unique conflict from two simultaneous
+first executions makes the loser roll back and replay the winner's committed record. The request
+hash covers the session, command schema, lease coordinates used by the first execution, and every
+semantic completion field. The stored response contains neither a capability nor provider upload
+ID. Idempotency replay is not authorization; it only replays an already-authorized committed result.
 
 A bounded server runner built from the same RoboLake application artifact claims `COMPLETING` rows
 from PostgreSQL (`FOR UPDATE SKIP LOCKED` or equivalent). No Kafka, Celery, or external queue is
@@ -260,21 +290,25 @@ completion lease. Recommended defaults are completion concurrency 2 (hard maximu
 seconds, and heartbeat 30 seconds. Heartbeat transactions remain independent and short while the
 potentially long provider call or full stream is in progress.
 
-The claimed runner performs this sequence:
+The claimed runner performs this sequence while the Blob remains `UPLOADING`:
 
 1. reconcile the deterministic final key first;
-2. only for `PARTS_READY` with no final object, construct ordered Complete input from stored
-   UploadPart **response** ETags, not ListParts-only ETags; `FINAL_PRESENT` never assembles an
+2. only for `PARTS_READY` with no final object, set `completion_phase=ASSEMBLING` and construct
+   ordered Complete input from stored UploadPart **response** ETags and
+   `ChecksumSHA256` receipts, never ListParts-only observations; `FINAL_PRESENT` never assembles an
    incomplete receipt set;
 3. call `CompleteMultipartUpload` with `If-None-Match: *`;
 4. require the SDK/adapter to parse the entire response and surface an embedded error even when HTTP
    status is 200;
 5. reconcile parsed success, embedded error, 412, 409, timeout, connection loss, and
    `NoSuchUpload` through final-key/provider facts;
-6. require final size and stream all final bytes through SHA-256;
-7. record immutable application evidence (`FULL_STREAM_SHA256`, observed digest/size/read bytes,
-   completion time, verifier implementation), then atomically fence Blob `AVAILABLE` and session
-   `COMPLETED`; and
+6. once the key is visible set `completion_phase=FINAL_PRESENT`, then
+   `completion_phase=FINAL_VERIFICATION`, require final size, and stream all final bytes through
+   SHA-256 without moving the Blob out of `UPLOADING`;
+7. after a successful complete read, use one short fenced transaction to record immutable
+   application evidence (`FULL_STREAM_SHA256`, observed digest/size/read bytes, completion time,
+   verifier implementation), transition Blob `UPLOADING -> VERIFYING -> AVAILABLE`, mark the session
+   `COMPLETED`, and release completion ownership; and
 8. allow normal Version finalization only after every referenced Blob is `AVAILABLE`.
 
 Every heartbeat and result write uses the current completion owner/epoch and database-time expiry.
@@ -283,12 +317,24 @@ final key and MPU before any provider write. If a prior full verification was in
 at byte zero; M2 deliberately has no Range-based verification resume. CLI disconnect or Ctrl-C stops
 only status polling, never accepted completion work.
 
+`completion_phase` has the closed values `PENDING`, `ASSEMBLING`, `FINAL_PRESENT`, and
+`FINAL_VERIFICATION`. It is session work progress, not Blob integrity state. A transient provider or
+GET failure leaves the Blob `UPLOADING` and the session `COMPLETING`; the current or replacement
+runner reconciles and retries. If the final object is absent and guarded same-MPU partial recovery is
+valid, the session returns `COMPLETING -> IN_PROGRESS` while the Blob is already `UPLOADING`. A proven
+whole-object mismatch is recorded in one fenced transaction that moves Blob
+`UPLOADING -> VERIFYING -> FAILED`, terminalizes the session, and derives `CONTACT_OPERATOR`.
+`VERIFYING` therefore represents the short database publication gate after complete byte evidence,
+never the long-running provider read.
+
 ETag is an opaque provider completion receipt only. Different part numbers with identical bytes may
 legitimately have identical ETags and provider checksums; no receipt or digest has a uniqueness
 constraint. The stored response ETag/checksum and latest listing ETag/checksum must agree before
-Complete, but only the response ETag is sent in the completion manifest. A lost response receipt forces exact-part
-re-upload even when ListParts shows matching bytes. This deliberately pays transfer cost for the
-portable AWS contract.
+Complete. Every ordered `CompletedPart` sent by RoboLake contains `PartNumber`, the stored response
+`ETag`, and the stored response `ChecksumSHA256`. A lost response receipt forces exact-part re-upload
+even when ListParts shows matching bytes. This deliberately pays transfer cost for RoboLake's
+portable checksum-enabled profile. A provider multipart composite checksum is never confused with
+the canonical whole-Blob SHA-256.
 
 MinIO's observed composite checksum was
 `base64(SHA256(raw-part-digests))-part_count`; it proves provider part composition but does not
@@ -333,10 +379,10 @@ sequenceDiagram
     CLI->>API: acquire(request_id, invocation_id)
     API->>DB: owner, epoch, and expiry
     CLI->>API: initiate with owner/epoch
-    API->>DB: CREATED -> INITIATING
+    API->>DB: CREATED → INITIATING
     API->>S3: CreateMultipartUpload(final key, SHA256)
     S3-->>API: opaque upload ID
-    API->>DB: persist ID, INITIATING -> IN_PROGRESS
+    API->>DB: persist ID, INITIATING → IN_PROGRESS
     loop rolling window
         CLI->>API: renew lease / request capabilities with epoch
         API-->>CLI: <= concurrency exact URLs
@@ -346,18 +392,20 @@ sequenceDiagram
         API->>S3: ListParts
         API->>DB: receipt-backed VERIFIED
     end
-    CLI->>API: complete
-    API->>DB: COMPLETING + pending work, release upload lease
-    API-->>CLI: 202 Accepted
+    CLI->>API: complete(request_id, request hash)
+    API->>DB: lookup idempotency before fence
+    API->>DB: first execution: fenced COMPLETING + PENDING work + lease release + stored 202
+    API-->>CLI: exact stored 202 Accepted
     Runner->>DB: claim completion lease
-    Runner->>S3: Complete using stored response ETags + If-None-Match: *
+    Runner->>S3: Complete using stored ETag + ChecksumSHA256 receipts + If-None-Match: *
     S3-->>Runner: parsed success result (not status alone)
+    Runner->>DB: phase FINAL_PRESENT → FINAL_VERIFICATION, Blob remains UPLOADING
     Runner->>S3: GET final object
     loop during long I/O
         Runner->>DB: heartbeat in short transaction
     end
     Runner->>Runner: stream SHA-256 == Blob identity
-    Runner->>DB: fenced evidence + Blob AVAILABLE + session COMPLETED
+    Runner->>DB: fenced evidence + Blob UPLOADING → VERIFYING → AVAILABLE + session COMPLETED
     CLI->>API: poll status
     API-->>CLI: COMPLETED
 ```
@@ -396,11 +444,11 @@ sequenceDiagram
     participant API
     participant DB
     participant S3
-    API->>DB: CREATED -> INITIATING
+    API->>DB: CREATED → INITIATING
     API->>S3: CreateMultipartUpload
     S3->>S3: provider may create an MPU
     S3--xAPI: response or DB commit outcome lost
-    API->>DB: generation FAILED / INITIATION_AMBIGUOUS when process can record it
+    API->>DB: fenced transaction: FAILED / INITIATION_AMBIGUOUS + release admission lease
     API-->>CLI: RETRY_PUSH
     CLI->>API: retry with new request UUID
     API->>DB: allocate next generation
@@ -424,7 +472,7 @@ sequenceDiagram
     S3-->>Runner: absent
     Runner->>S3: ListParts same upload ID
     S3-->>Runner: structurally valid subset
-    Runner->>DB: guarded COMPLETING -> IN_PROGRESS
+    Runner->>DB: guarded COMPLETING → IN_PROGRESS, Blob remains UPLOADING
     Runner->>DB: receipt-backed matches VERIFIED, others PENDING, release completion lease
     CLI->>API: poll sees IN_PROGRESS, acquire upload lease
     API-->>CLI: upload only unresolved parts
@@ -447,7 +495,7 @@ sequenceDiagram
     CLI->>API: retry push with new request/invocation IDs
     API->>DB: bind request to generation n+1, every part PENDING
     CLI->>API: acquire upload lease and initiate
-    API->>DB: CREATED -> INITIATING
+    API->>DB: CREATED → INITIATING
     API->>S3: new MPU / new upload ID
     API->>DB: durable ID, IN_PROGRESS
     Note over API,S3: no old request mapping, provider receipt, or part observation is reused
@@ -473,9 +521,10 @@ sequenceDiagram
     R2->>DB: claim after expiry with epoch 2
     R2->>S3: HEAD deterministic final key
     S3-->>R2: object exists
+    R2->>DB: phase FINAL_PRESENT → FINAL_VERIFICATION, Blob remains UPLOADING
     R2->>S3: streamed GET
     R2->>R2: full SHA-256 matches from byte zero
-    R2->>DB: fenced AVAILABLE and COMPLETED
+    R2->>DB: fenced evidence + UPLOADING → VERIFYING → AVAILABLE + COMPLETED
     CLI->>API: poll status
     API-->>CLI: idempotent success
 ```
@@ -494,7 +543,7 @@ sequenceDiagram
     S3-->>A: 200 winner
     S3-->>B: 412 precondition failed
     A->>S3: full-byte verify final key
-    A->>DB: fenced AVAILABLE attestation
+    A->>DB: fenced UPLOADING → VERIFYING → AVAILABLE attestation
     B->>S3: reconcile and full-byte verify final key
     B->>DB: converge on matching AVAILABLE Blob
     B->>S3: abort losing incomplete MPU if still present
@@ -518,9 +567,10 @@ sequenceDiagram
         API->>DB: COMPLETING / FINAL_PRESENT, release upload lease
         API-->>CLI: 202 Accepted
         Runner->>DB: claim completion lease
+        Runner->>DB: phase FINAL_VERIFICATION, Blob remains UPLOADING
         Runner->>S3: streamed GET
         Runner->>Runner: size and full SHA-256 match
-        Runner->>DB: fenced Blob AVAILABLE + session COMPLETED
+        Runner->>DB: fenced Blob UPLOADING → VERIFYING → AVAILABLE + session COMPLETED
         CLI->>API: poll status
         API-->>CLI: safely adopted
     end
@@ -540,7 +590,7 @@ sequenceDiagram
     Runner->>DB: claim completion lease
     Runner->>S3: streamed GET final key
     Runner->>Runner: SHA-256 or size mismatch
-    Runner->>DB: fenced session FAILED, Blob remains non-AVAILABLE
+    Runner->>DB: fenced evidence + Blob UPLOADING → VERIFYING → FAILED + session FAILED
     CLI->>API: poll status
     API-->>CLI: STORED_OBJECT_MISMATCH / CONTACT_OPERATOR
     Note over Runner,S3: no overwrite and no automatic delete
@@ -606,8 +656,8 @@ of immutable successful evidence.
 | Status | Existing `GET /upload-sessions/{id}` adds generation, safe state, completion reason/phase, and derived part totals; no provider upload ID or completion lease secret is exposed. `COMPLETING` status is polled without an upload lease. |
 | Reconcile | `POST /upload-sessions/{id}/reconcile`; current lease owner/epoch required for resulting writes. API paginates `ListParts` and returns safe states. |
 | Issue capabilities | `POST /upload-sessions/{id}/part-capabilities` with current lease fence and requested missing part numbers; response is bounded by the rolling window. |
-| Confirm part | `POST /upload-sessions/{id}/parts/{number}/confirm` carries the current fence plus UploadPart response ETag/checksum. API treats them as untrusted input until ListParts matches, then retains the response receipt for Complete. |
-| Complete/publish | Existing `POST /upload-sessions/{id}/complete` validates upload fence, accepts durable work, releases the upload lease, and returns 202. A same-artifact runner owns conditional Complete/full verification; CLI polls status. |
+| Confirm part | `POST /upload-sessions/{id}/parts/{number}/confirm` carries the current fence plus the complete UploadPart response ETag and Base64 `ChecksumSHA256`. API treats them as untrusted input until ListParts matches, then retains both response fields for Complete. |
+| Complete/publish | Existing `POST /upload-sessions/{id}/complete` checks immutable idempotency replay before the upload fence. First execution atomically accepts `COMPLETING`, creates pending work, releases the upload lease, stores the exact 202 response, and returns it. A same-artifact runner owns conditional Complete/full verification; CLI polls status. |
 | Abort | `POST /upload-sessions/{id}/abort` with current upload fence; `CREATED` cancels locally, `INITIATING` returns retryable initiation-in-progress, and provider abort requires a durable upload ID. Never implicit on Ctrl-C. |
 | Resume | Existing `robolake push SOURCE --dataset NAME` rescans, resolves the same Version/Blob/session, and transfers unresolved parts. Optional `--part-concurrency` is bounded 1..16. |
 
@@ -625,6 +675,7 @@ Stable M2 errors extend, but do not rename, M1 codes:
 | `ADMISSION_LEASE_HELD` | Another unexpired invocation owns this session. | `RETRY_PUSH` after status/backoff | 4 |
 | `ADMISSION_CAPACITY_EXHAUSTED` | All configured upload-admission lease slots are currently active. | `RETRY_PUSH` after bounded backoff | 4 |
 | `ADMISSION_LEASE_LOST` | Invocation no longer owns the current unexpired fencing epoch. | `RETRY_PUSH` reacquires/resolves | 4 |
+| `IDEMPOTENCY_CONFLICT` | A request ID was replayed with different canonical semantic content. | Use the original payload or a new request ID | 3 |
 | `MULTIPART_COMPLETION_AMBIGUOUS` | Completion has no provable final outcome yet. | `RETRY_PUSH` | 4 |
 | `FINAL_BLOB_PUBLICATION_CONFLICT` | 409/412 requires deterministic-key reconciliation. | `RETRY_PUSH` unless a matching final is adopted | 4 |
 | `STORED_OBJECT_MISMATCH` | Final bytes do not equal the immutable content address. | `CONTACT_OPERATOR` | 5 |
@@ -661,8 +712,10 @@ and multipart limits:
 - [Multipart overview](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)
 - [Multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)
 - [UploadPart](https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html)
+- [CompletedPart](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompletedPart.html)
 - [ListParts](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListParts.html)
 - [Object integrity](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)
+- [Additional-checksum multipart tutorial](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tutorial-s3-mpu-additional-checksums.html)
 
 Provider adapters must pass the same integration contract. MinIO-specific composite formatting,
 error strings, and ETags are not protocol. A provider that cannot enforce conditional completion,

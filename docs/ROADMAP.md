@@ -73,13 +73,15 @@ later milestones must not be pulled forward as speculative infrastructure.
   rolling window of short-lived part URLs.
 - Separate immutable request replay, CLI invocation metrics, and Blob-scoped provider-attempt
   generations; make provider initiation ambiguity explicit.
-- Retain UploadPart response ETags and SHA-256 checksums, use the ETags for Complete, and use
-  paginated `ListParts` only to verify current provider state; receipt loss retransmits that exact
-  part safely.
+- Retain a complete UploadPart response receipt (PartNumber, ETag, Base64 `ChecksumSHA256`), send both
+  response fields for every ordered part in Complete, and use paginated `ListParts` only to verify
+  current provider state; receipt loss retransmits that exact part safely.
 - Keep persistent sessions separate from expiring upload admission and completion-runner leases so
   abandoned clients/workers cannot permanently consume their separate caps.
-- Accept completion as PostgreSQL work, return 202, then let a same-artifact runner complete directly
-  at the final key with `If-None-Match: *` and stream full SHA-256 before `AVAILABLE`.
+- Replay committed completion responses before admission fencing; first acceptance atomically stores
+  PostgreSQL work, releases admission, and returns 202. A same-artifact runner completes directly at
+  the final key with `If-None-Match: *`; Blob stays `UPLOADING` until full-stream evidence enters the
+  short `VERIFYING` publication transaction.
 - Bound abandoned incomplete MPUs with same-workflow abort and provider stale-upload expiry; do not
   add temporary objects, final-object deletion, automatic repair, or general Blob GC.
 

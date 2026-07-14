@@ -171,20 +171,35 @@ ListParts-only ETag is a portable replacement for a lost UploadPart response rec
 
 AWS's multipart overview instructs clients to retain the part number and ETag returned by each
 UploadPart and explicitly says not to use the listing result as the Complete request source. The
-UploadPart API likewise says the response ETag must be retained for Complete. M2 therefore stores:
+UploadPart API likewise says the response ETag must be retained for Complete. M2 therefore defines:
 
-- `upload_response_etag` and the requested SHA-256 response checksum from an unambiguous UploadPart
-  response; and
-- separate `listed_*` observations from paginated ListParts.
+```text
+CompletedPartReceipt
+  part_number
+  response_etag
+  response_checksum_sha256_base64
+```
 
-Supported M2 providers must return the requested response checksum; absence fails the provider
-contract. The adapter normalizes provider base64 checksum values to lowercase hexadecimal before
-comparison and persistence. ListParts proves current provider state. It does not manufacture a
-missing response receipt. If an UploadPart response is lost but a matching part appears in
-ListParts, M2 reissues the exact
+Both response fields come from one unambiguous successful UploadPart response. Separate `listed_*`
+fields retain paginated ListParts observations. Supported M2 providers must return the requested
+response checksum; absence fails the provider contract. The canonical expected digest remains
+lowercase hexadecimal. The provider receipt is canonical padded Base64 of the same 32 raw digest
+bytes, computed as `base64.b64encode(bytes.fromhex(expected_hex)).decode("ascii")`; decoding and byte
+equality are validated.
+
+ListParts proves current provider state. It does not manufacture a missing response receipt. If an
+UploadPart response is lost but a matching part appears in ListParts, M2 reissues the exact
 checksum/length-bound capability, re-uploads that part, captures the new response receipt, and then
-verifies it again. Complete uses only ordered stored UploadPart response ETags. This behavior is
-AWS-documented but was not live-tested against AWS in this design task.
+verifies it again. Complete uses ordered `CompletedPart` values containing PartNumber, stored
+response ETag, and stored response `ChecksumSHA256`.
+
+AWS models `CompletedPart.ChecksumSHA256` as optional in the general API. RoboLake deliberately makes
+it mandatory in its checksum-enabled SHA-256 multipart profile; this is a RoboLake portability rule,
+not a claim that AWS universally requires it. AWS documents that UploadPart returns ETag and the
+requested checksum, that Complete accepts per-part checksum fields, and that ListParts is for
+verification rather than the Complete receipt source. AWS was not contacted in this design task.
+The pinned-MinIO classifications above cover only the live operations listed in the probe table; the
+complete-receipt profile requires an implementation contract test.
 
 ## Completion response contract
 
@@ -205,9 +220,11 @@ Official references:
 
 - [AWS conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
 - [AWS CompleteMultipartUpload API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html)
+- [AWS CompletedPart API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompletedPart.html)
 - [AWS multipart overview](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)
 - [AWS UploadPart API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html)
 - [AWS ListParts API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListParts.html)
+- [AWS multipart additional-checksum tutorial](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tutorial-s3-mpu-additional-checksums.html)
 - [AWS checksum types](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)
 - [AWS AbortMultipartUpload](https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html)
 - [AWS multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)
@@ -224,7 +241,9 @@ Official references:
 - Seven-day stale-upload expiry was configured but not observed by waiting or changing server time.
 - AWS was not contacted by these probes; AWS portability statements come from official API/user
   documentation. In particular, response-receipt retention versus ListParts-only completion needs a
-  future live AWS contract run before claiming AWS as tested.
+  future live AWS contract run before claiming AWS as tested. The RoboLake Complete profile's
+  per-part ETag-plus-`ChecksumSHA256` input also remains an implementation-time pinned-MinIO contract
+  test rather than a newly claimed probe result.
 - Multi-gigabyte throughput and memory were not measured in this design task.
 - The 5 TiB pinned-MinIO maximum was source-inspected, not exercised by uploading a multi-TiB
   object. RoboLake deliberately uses AWS's lower 5 TB maximum as its cross-provider protocol bound.

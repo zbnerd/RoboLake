@@ -26,7 +26,7 @@ Add nullable multipart fields:
 | `initiation_ambiguous_at` | `timestamptz` | Required for terminal `INITIATION_AMBIGUOUS`; no upload ID is claimed. |
 | `completion_requested_at` | `timestamptz` | Required in/after `COMPLETING`; makes the PostgreSQL row durable pending work. |
 | `completion_reason` | `varchar(32)` | `PARTS_READY` or `FINAL_PRESENT`; immutable while one accepted work item remains `COMPLETING`. A later legal re-entry after guarded requeue may replace it. It selects the structural entry gate, not integrity truth. |
-| `completion_phase` | `varchar(32)` | Nullable safe phase: `PENDING_CLAIM`, `PROVIDER_COMPLETION`, `FINAL_VERIFICATION`, or `RECONCILING`; diagnostic, not progress proof. |
+| `completion_phase` | `varchar(32)` | Nullable outside `COMPLETING`; while completing exactly `PENDING`, `ASSEMBLING`, `FINAL_PRESENT`, or `FINAL_VERIFICATION`. This is session work progress, not Blob integrity state or byte progress. |
 | `completion_attempted_at` | `timestamptz` | Runner observation of the latest provider Complete attempt; not success proof. |
 | `last_completion_result` | `varchar(32)` | Nullable application observation such as `AMBIGUOUS`, `CONFLICT_409`, or `EMBEDDED_ERROR`; never integrity proof. |
 | `last_provider_reconciled_at` | `timestamptz` | Application-recorded time of the latest complete paginated `ListParts`. |
@@ -65,21 +65,31 @@ are immutable and never reactivated.
 
 ## Request and invocation identity
 
-Reuse `idempotency_records` with two M2 scopes:
+Reuse `idempotency_records` with three M2 scopes:
 
 - `multipart-session-resolve`: `key` is canonical UUID `request_id`, request SHA-256 covers the typed
   create/resolve body, and `resource_id` permanently identifies the resolved session generation;
 - `multipart-admission-acquire`: `key` is canonical UUID acquire `request_id`, request SHA-256 covers
   session plus `invocation_id`, and `response_json` permanently records owner/epoch/expiry result;
 - `multipart-completion-accept`: `key` is the completion request UUID, request SHA-256 covers the
-  session/fence command, and the response permanently records 202 acceptance or an already-terminal
-  idempotent result.
+  session, command schema, original fence coordinates, and every semantic completion field; the
+  response permanently records the canonical 202 acceptance or an already-terminal idempotent
+  result without a capability or provider upload ID.
 
 M2 scope rows are immutable after their complete response is inserted. Reuse with another canonical
 request digest returns `IDEMPOTENCY_CONFLICT`; no terminal session or old request record is rebound.
 `invocation_id` is a separate UUID for one CLI run and is stored on the admission lease for metrics
 and diagnosis. Replaying an expired acquire request returns its original expired result; reacquisition
 uses a new request UUID. Existing M1 idempotency keys/scopes remain unchanged.
+
+Completion lookup precedes admission fencing. An existing matching hash returns the stored response
+without reading the lease/session for action; a mismatching hash returns `IDEMPOTENCY_CONFLICT`.
+Only an absent record reaches first-execution fence and Part validation. In one transaction, first
+execution transitions the session to `COMPLETING`, sets `completion_phase=PENDING`, creates pending
+completion work, releases the upload lease, and inserts the immutable 202 record. The scope/key
+unique constraint makes simultaneous first executions converge: the loser rolls back, rereads, and
+replays the committed record. This transaction boundary is required for response loss, process death
+after commit, lease release/expiry, and completion-runner takeover.
 
 A scope-aware constraint/trigger validates canonical UUID keys and the expected resource type for M2
 records, then rejects update/delete after insertion. It must not tighten or reinterpret existing M1
@@ -108,10 +118,10 @@ upload_parts
   sha256                   char(64)
   state                    varchar(16)  PENDING|UPLOADED|VERIFIED
   upload_response_etag     text null
-  upload_response_checksum_sha256 char(64) null
+  upload_response_checksum_sha256_base64 varchar(44) null
   upload_response_received_at timestamptz null
   listed_etag              text null
-  listed_checksum_sha256   char(64) null
+  listed_checksum_sha256_base64 varchar(44) null
   listed_size_bytes        bigint null
   provider_listed_at       timestamptz null
   last_capability_issued_at timestamptz null
@@ -129,12 +139,14 @@ UNIQUE (upload_session_id, offset_bytes)
 Checks:
 
 - part number `1..10_000`, offset `>= 0`, size `> 0`, canonical lowercase SHA-256;
-- `UPLOADED` requires `upload_response_etag`, normalized hexadecimal
-  `upload_response_checksum_sha256`, `upload_response_received_at`, and `uploaded_at`;
+- `UPLOADED` requires `upload_response_etag`, canonical padded RFC 4648
+  `upload_response_checksum_sha256_base64`, `upload_response_received_at`, and `uploaded_at`;
 - `VERIFIED` requires the stored UploadPart response ETag, current listed ETag equal to that response
   ETag, listed size equal to expected size, listed SHA-256 equal to expected SHA-256, and
-  `provider_listed_at`/`verified_at`; the normalized response checksum must equal the expected
-  SHA-256;
+  `provider_listed_at`/`verified_at`; decoding response/listed Base64 must yield exactly 32 bytes and
+  equal the bytes decoded from expected lowercase hexadecimal `sha256`;
+- each persisted provider checksum matches `^[A-Za-z0-9+/]{43}=$` and round-trips through PostgreSQL
+  `decode(value, 'base64')`/`encode(..., 'base64')`, preventing non-canonical encodings;
 - capability timestamps/count are optional diagnostic metadata and never part state or progress;
 - receipt/checksum lengths are bounded; ETag is never an integrity predicate by itself;
 - session must use `MULTIPART` strategy; and
@@ -144,11 +156,18 @@ Different part numbers may contain identical bytes and therefore may have identi
 SHA-256 values, response/listed checksums, and response/listed ETags. None is unique. Uniqueness
 applies only to `(upload_session_id, part_number)` and the immutable non-overlapping range plan.
 
-ListParts is current-provider evidence, not the source of the completion receipt. A matching listed
-part with no durable `upload_response_etag` remains `PENDING` and must be re-uploaded to capture a
-successful UploadPart response. Complete uses `upload_response_etag` values only, ordered by part
-number. This follows the AWS multipart guidance and remains a required portability contract even
-though pinned MinIO returns matching ETags through both APIs.
+The complete receipt is
+`(part_number, upload_response_etag, upload_response_checksum_sha256_base64)` from one successful
+UploadPart response. Expected part SHA-256 remains lowercase hexadecimal. Provider request/response
+`ChecksumSHA256` is the canonical padded Base64 encoding of those same 32 raw bytes; deterministic
+conversion is `base64.b64encode(bytes.fromhex(sha256)).decode("ascii")`. A multipart composite
+checksum is not accepted as either this per-part digest or canonical whole-Blob SHA-256.
+
+ListParts is current-provider evidence, not the source of a complete receipt. A matching listed part
+with either response receipt field missing remains `PENDING` and must be re-uploaded exactly to
+capture a successful response. Complete sends `PartNumber`, `upload_response_etag`, and
+`upload_response_checksum_sha256_base64`, ordered by part number. AWS makes checksum fields optional
+in the general `CompletedPart` model; their presence is a deliberate RoboLake SHA-256 profile rule.
 
 ## New `multipart_admission_leases` table
 
@@ -182,6 +201,17 @@ predicate that also requires unexpired database time. Zero affected rows maps to
 `ADMISSION_LEASE_LOST`. Status reads do not require a lease. Structural database triggers do not
 claim to prove caller lease ownership; privileged operator SQL is outside the application fence.
 
+“Release” or “end” retains the lease row and its fencing history but sets `expires_at` to database
+time (and updates `renewed_at`) in the owning transaction. It does not delete the row or reset epoch.
+A later guarded recovery reacquires by incrementing epoch, so stale coordinates can never become
+current again.
+
+The normal `INITIATING -> FAILED(INITIATION_AMBIGUOUS)` repository operation requires the current
+owner/epoch and performs the terminal session update plus admission-lease release in one transaction.
+A stale owner changes neither row. If the process dies before terminalization, database-time lease
+expiry is the bounded fallback. Consequently, terminalizing 64 ambiguous initiations immediately
+returns all 64 admission slots without waiting for TTL.
+
 ## New `multipart_completion_leases` table
 
 ```text
@@ -206,6 +236,13 @@ in one atomic repository statement. Heartbeats use short independent transaction
 Complete or full GET is in flight. Lease expiry does not change session state; a new runner
 reconciles and restarts whole-object verification from byte zero if needed.
 
+The Blob remains `UPLOADING` during `ASSEMBLING`, `FINAL_PRESENT`, and `FINAL_VERIFICATION`. A
+successful complete read is published in one short fenced transaction that writes immutable
+evidence, transitions Blob `UPLOADING -> VERIFYING -> AVAILABLE`, sets session `COMPLETED`, and ends
+completion ownership. Proven mismatch similarly writes mismatch evidence and transitions Blob
+`UPLOADING -> VERIFYING -> FAILED` plus terminal session failure. Transient provider/read failure
+commits neither evidence nor a Blob transition.
+
 ## Deferred constraint triggers
 
 Use PostgreSQL constraint triggers so one transaction can insert a complete plan before sealing it.
@@ -223,12 +260,15 @@ Use PostgreSQL constraint triggers so one transaction can insert a complete plan
 4. **Initiation gate:** `CREATED -> INITIATING` requires complete plan and
    `initiation_started_at`; `INITIATING -> IN_PROGRESS` requires one durable provider upload ID;
    `INITIATING -> FAILED` with `INITIATION_AMBIGUOUS` requires `initiation_ambiguous_at` and never
-   invents an upload ID. `CREATED -> CANCELLED` is the only no-provider cancellation edge.
-5. **Completing gate:** entering `COMPLETING` requires `completion_requested_at`/`PENDING_CLAIM` and
+   invents an upload ID. The application repository must atomically fence this terminal transition
+   and release admission; a trigger can enforce row structure but not caller ownership.
+   `CREATED -> CANCELLED` is the only no-provider cancellation edge.
+5. **Completing gate:** entering `COMPLETING` requires `completion_requested_at`/`PENDING` and
    one reason that stays immutable until guarded exit or terminal completion. A later legal re-entry
    may replace it. `PARTS_READY` requires all `N` rows `VERIFIED`, a non-null stored UploadPart
-   response ETag/checksum, equal latest listed ETag/checksum, and exact listed size/checksum on every
-   part.
+   response ETag/Base64 checksum, equal latest listed ETag/Base64 checksum, and exact listed
+   size/checksum on every part. Ordered Complete input contains PartNumber plus both stored response
+   receipt fields.
    `FINAL_PRESENT` requires a freshly application-recorded final-key existence observation and is
    allowed from `IN_PROGRESS` or `ABORTING` without pretending incomplete parts are verified.
    Receipts and digests need not be distinct.
@@ -248,8 +288,10 @@ Use PostgreSQL constraint triggers so one transaction can insert a complete plan
    `observed_size_bytes = blobs.size_bytes`, and `verification_read_bytes = blobs.size_bytes`.
    Every part must be VERIFIED only for `PARTS_READY`; `FINAL_PRESENT` may adopt a matching final
    object without falsely resolving this session's incomplete parts.
-9. **Blob availability gate:** an associated locked multipart session must carry the same
-   structurally consistent evidence. Existing M1 availability paths remain legal.
+9. **Blob publication gate:** the Blob remains `UPLOADING` until complete external evidence exists.
+   An associated locked multipart session must carry structurally consistent evidence for the short
+   `UPLOADING -> VERIFYING -> AVAILABLE|FAILED` transaction. Existing M1 availability paths remain
+   legal.
 10. **Lease structure:** upload and completion lease rows require positive epochs and sane database
     timestamps. Caller/runner ownership is enforced by atomic repository SQL predicates, not by a
     trigger that claims knowledge of the external caller.

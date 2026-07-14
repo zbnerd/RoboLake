@@ -24,18 +24,18 @@ The protected properties are:
 | Threat / concrete failure | Selected control | Cost and residual risk | M1 semantic effect |
 | --- | --- | --- | --- |
 | Unlimited sessions or concurrent-session storm | Blob-locked generation allocation, one active generation per Blob, immutable request binding, expiring upload lease cap, maximum 10,000 parts/session, and request limits. | An unauthenticated caller can still create terminal generations/rows across fake Blobs. Trusted-network placement and external quotas remain mandatory. | None. |
-| Request replay aliases another attempt | UUID request record binds canonical digest and session forever; terminal generation never reopens. | Retains idempotency history until an explicit future retention policy. | None. |
+| Request replay aliases another attempt | UUID request record binds canonical digest and session forever; terminal generation never reopens. Completion replay lookup/hash validation precedes lease/session inspection, while changed payload returns `IDEMPOTENCY_CONFLICT`. | Retains idempotency history until an explicit future retention policy. A replay is not new authorization. | None. |
 | Abandoned sessions permanently consume capacity | Upload capacity counts only unexpired admission leases. Expired leases are atomically reacquired with a higher epoch; persistent session/MPU remains resumable. | Requires heartbeat, DB-time expiry, advisory-lock acquisition, and fencing on every mutation. | None. |
 | Stale invocation mutates after takeover | Atomic repository owner/epoch/DB-expiry fence on upload-phase mutations. | An already dispatched provider request cannot be recalled; the current owner reconciles it. DB triggers protect structure, not caller identity. | None. |
-| Long Complete/full GET outlives CLI/API timeout | Completion is durable PostgreSQL work claimed by a same-artifact runner with independent renewable lease/heartbeat. | Requires a continuously supervised runner and DB availability; interrupted verification restarts from byte zero. | None. |
+| Long Complete/full GET outlives CLI/API timeout | Completion is durable PostgreSQL work claimed by a same-artifact runner with independent renewable lease/heartbeat. Blob remains `UPLOADING`; session completion phase represents long work. | Requires a continuously supervised runner and DB availability; interrupted verification restarts from byte zero. | None. |
 | Dead/stale completion runner publishes | Post-provider evidence, AVAILABLE, and terminal writes require current completion owner/epoch/expiry. Takeover reconciles deterministic final key first. | Two provider calls may overlap after lease expiry, but conditional final publication and fencing converge. | None. |
-| Lost UploadPart response leads to fabricated ETag | Store UploadPart response receipts; ListParts only verifies current state. Receipt-less listed parts are re-uploaded. | Safe retransmission costs bandwidth. AWS portability is documentation-derived until live AWS contract tests. | None. |
-| Ambiguous provider initiation leaves unknown MPU | Explicit `INITIATING`; ambiguity terminates generation, never guesses/adopts ID; best-effort abort only when in-memory ID remains; lifecycle cleanup is backstop. | Unknown MPU may consume storage until lifecycle policy. | None. |
+| Lost UploadPart response leads to fabricated Complete input | Store a complete successful-response receipt containing PartNumber, ETag, and Base64 `ChecksumSHA256`; ListParts only verifies current state. Missing-receipt listed parts are re-uploaded exactly. | Safe retransmission costs bandwidth. AWS portability is documentation-derived until live AWS contract tests. | None. |
+| Ambiguous provider initiation leaves unknown MPU or occupied slot | Explicit `INITIATING`; ambiguity atomically terminalizes the generation and releases admission under the current fence, never guesses/adopts ID; best-effort abort only when in-memory ID remains; TTL/lifecycle are backstops. | Unknown MPU may consume storage until lifecycle policy; process death before the transaction retains capacity only until lease TTL. | None. |
 | Tiny-part abuse | Server computes the frozen 64 MiB-based algorithm; clients cannot select boundaries. | Maximum-size objects still create up to 10,000 rows/requests. | None. |
 | Oversized object or metadata | 5,000,000,000,000-byte M2 Blob maximum, 10,000 parts, existing 100,000-entry/64 MiB manifest limits, strict integer checks. | Operators must provision storage quotas externally. | Adds M2-only transfer limit. |
 | Presigned capability leakage | 900-second TTL, rolling window <= concurrency, exact key/upload/part/length/checksum signing, query redaction. | A bearer can replay the exact part until expiry even after lease loss; it cannot change digest/size or call API mutation with a stale fence. | Extends M1 capability rule. |
 | Part-number substitution | Part number and provider upload ID are signed; API issues only frozen plan members under a current lease. | Provider error text is never trusted/exposed. | None. |
-| Checksum omission or tampering | `Content-Length` and `x-amz-checksum-sha256` are signed; confirmation stores response receipt and verifies through ListParts. | Unsupported providers fail closed. | None. |
+| Checksum omission, encoding confusion, or tampering | `Content-Length` and `x-amz-checksum-sha256` are signed; confirmation requires response ETag and canonical Base64 `ChecksumSHA256`, normalizes it to the planned raw digest, and verifies through ListParts. Complete sends both receipt fields. | Unsupported providers fail closed. Multipart composite checksum is never whole-Blob identity. | None. |
 | Replay after part verification | Replayed URL can replace only the same part number with the same length/SHA-256 while the MPU exists. | Consumes bandwidth and may change opaque ETag; API reconciles again. | None. |
 | Source file changes during resume | Full and per-part hashes before transfer, positional-read rehash, final stable whole-file rehash before Complete. | Changes can waste transfer but cannot publish a different Blob identity. | Strengthens M1 stability without redefining identity. |
 | Temporary-key collision/leakage | Selected architecture has no temporary key. | No temp cleanup namespace exists. | None. |
@@ -76,6 +76,11 @@ without renewal the leases no longer count against capacity; a new invocation ca
 Taking over one session atomically increments its epoch. No cleanup, provider abort, or state expiry
 is inferred from lease expiry.
 
+When an active owner can prove initiation ambiguity, its fenced terminal transaction releases the
+admission lease immediately; it does not wait for TTL. Sixty-four such terminalizations therefore
+return all capacity at once. If the process dies before it can commit, TTL provides the bounded
+fallback, and a later owner may terminalize under its new epoch.
+
 Completion rows do not consume upload capacity. Only unexpired completion leases count against the
 separate completion cap. A runner heartbeats every 30 seconds in independent short transactions
 while provider Complete or full-byte verification is in flight. Expiry permits takeover but does not
@@ -88,6 +93,13 @@ upload lease owner UUID/epoch. Mutating API requests carry that owner and epoch.
 predicate rejects a missing, expired, or stale fence with `ADMISSION_LEASE_LOST`/`RETRY_PUSH`. The CLI
 renews while part requests are active. The API only accepts completion work and returns 202; the CLI
 never receives a provider completion capability, so a stale CLI cannot publish a final object.
+
+Completion acceptance is the narrow exception to “fence first”: the endpoint first checks whether
+the operation scope/request ID already has an immutable result. A matching hash returns the exact
+stored safe 202 without requiring a current lease; a mismatching hash fails before session action.
+Only first execution validates the admission fence, then atomically stores `COMPLETING` work, releases
+the lease, and stores the 202. The record contains no capability or provider upload ID, so replay
+does not extend storage authority.
 
 A part URL issued before lease loss may remain usable. It can write only the signed checksum/length
 to the same part number. The current owner classifies any later matching discovery as reconciled;

@@ -30,12 +30,15 @@ initiation can create the next generation. Concurrent creators converge through 
 partial unique index; terminal sessions are never reactivated.
 
 Capability issuance is optional diagnostic metadata, not part state, audit history, or transfer
-progress. Reissuance is permitted. Only `VERIFIED` parts contribute to progress: PostgreSQL stores
-the opaque UploadPart response ETag and normalized SHA-256 checksum while paginated ListParts proves
-current provider presence. Client input alone and ListParts-only ETags/checksums are insufficient
-completion receipts. Supported providers must return the requested response checksum. When the
-response receipt was lost, RoboLake re-uploads the same checksum/length-bound part number to obtain
-a new response receipt, then reconciles it.
+progress. Reissuance is permitted. Only `VERIFIED` parts contribute to progress. PostgreSQL stores a
+complete successful-response receipt: part number, opaque UploadPart response ETag, and Base64
+`ChecksumSHA256`; paginated ListParts separately proves current provider presence. The expected part
+digest remains lowercase hex, and the provider checksum must decode to the same 32 raw bytes. Client
+input alone and ListParts-only observations are insufficient. Supported providers must return both
+response fields. When the response receipt was lost, RoboLake re-uploads the same
+checksum/length-bound part number to obtain a new receipt, then reconciles it. Complete sends
+PartNumber plus both response fields for every part. AWS's general API makes the checksum field
+optional; requiring it is RoboLake's checksum-enabled SHA-256 profile.
 
 Part size starts at 64 MiB, doubles until at most 10,000 parts are needed, and caps at 5 GiB. Blob
 size is capped at the portable AWS/MinIO intersection of 5,000,000,000,000 bytes. The
@@ -57,22 +60,32 @@ Only unexpired leases count toward the upload cap. Repository mutations use atom
 over session, owner, epoch, and database-time expiry; a zero-row write is
 `ADMISSION_LEASE_LOST`. Structural triggers do not claim to authenticate caller fence values.
 
-Completion is separately server-owned. The complete request validates the upload fence and freezes
-reason `PARTS_READY` (all receipt-backed) or `FINAL_PRESENT` (adoption path) for that accepted work item, atomically sets
-`COMPLETING`, releases the upload lease, and returns 202. A bounded runner using the same
+Completion is separately server-owned. The complete request first looks up immutable idempotency by
+scope/request ID and validates the request hash. A matching record returns its exact stored response
+without a current lease; mismatch returns `IDEMPOTENCY_CONFLICT`. Only first execution validates the
+upload fence and freezes reason `PARTS_READY` (all receipt-backed) or `FINAL_PRESENT` (adoption path).
+One transaction sets `COMPLETING`/`PENDING`, creates pending work, releases the upload lease, and
+stores the canonical 202 response. A unique race loser replays the winner. A bounded runner using the same
 application artifact claims PostgreSQL `COMPLETING` rows with a distinct completion owner/epoch and
 lease. Default completion concurrency is 2 (hard maximum 8); default lease/heartbeat are 120/30
 seconds. It heartbeats in short transactions at most one third of TTL throughout provider Complete
 and the full stream. A stale runner cannot commit evidence, Blob AVAILABLE, or terminal state; a
 takeover reconciles final state and restarts interrupted full GET from byte zero.
 
+Blob stays `UPLOADING` throughout provider completion, reconciliation, and whole-object GET/hash.
+Session `completion_phase` is `PENDING`, `ASSEMBLING`, `FINAL_PRESENT`, or `FINAL_VERIFICATION`.
+Only after a complete read does one short fenced transaction record evidence and move Blob
+`UPLOADING -> VERIFYING -> AVAILABLE` plus session `COMPLETED`. Proven mismatch uses
+`UPLOADING -> VERIFYING -> FAILED`; transient failure commits no Blob transition.
+
 Provider initiation has an explicit crash boundary. `CREATED` means no provider request was sent and
 may become `CANCELLED`. The API records `INITIATING` before CreateMultipartUpload. Only a durably
 stored upload ID permits `IN_PROGRESS`; response loss or process failure before that commit becomes
-terminal `FAILED` with initiation-ambiguous reason. If the process still knows the in-memory ID after
-a DB failure it may best-effort abort without claiming success. An abort while `INITIATING` returns a
+terminal `FAILED` with initiation-ambiguous reason and releases admission in the same current-owner
+fenced transaction. If the process still knows the in-memory ID after a DB failure it may
+best-effort abort without claiming success. An abort while `INITIATING` returns a
 retryable in-progress error, and an unaddressable orphan relies on provider lifecycle cleanup rather
-than a false abort claim.
+than a false abort claim. Process death before the terminal transaction falls back to lease TTL.
 
 `COMPLETING -> IN_PROGRESS` is legal only when the final key is absent, the same provider MPU still
 exists, completion was not 409, and a complete structurally valid ListParts result supports safe

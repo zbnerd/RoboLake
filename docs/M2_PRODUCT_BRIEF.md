@@ -23,18 +23,21 @@ uploading the same content concurrently.
 - preserve that resumable session independently from a short-lived fenced admission lease;
 - issue short-lived, length- and SHA-256-bound UploadPart capabilities;
 - upload a small rolling window with bounded parallelism;
-- retain UploadPart response receipts and reconcile them with paginated provider `ListParts` results;
+- retain complete UploadPart response receipts (part number, ETag, Base64 `ChecksumSHA256`) and
+  reconcile them with paginated provider `ListParts` results;
 - replace only missing or mismatching incomplete parts;
-- accept completion asynchronously, then let a PostgreSQL-claimed server runner complete directly at
-  the deterministic Blob key using `If-None-Match: *`;
-- keep the runner alive with a separately fenced completion lease while it streams the completed
-  object to prove its full SHA-256 before `AVAILABLE`;
+- replay an already accepted completion before lease fencing; for first execution, atomically accept
+  completion, release upload admission, store the 202 response, then let a PostgreSQL-claimed server
+  runner complete directly at the deterministic Blob key using `If-None-Match: *`;
+- keep the runner alive with a separately fenced completion lease while Blob remains `UPLOADING` and
+  it streams the completed object to prove full SHA-256 before the short publication transaction;
 - converge concurrent publishers without overwriting or deleting a final object; and
 - explicitly abort an active workflow while retaining provider stale-upload cleanup as a backstop.
 
 Provider initiation is explicit: `CREATED` means no request has been sent, `INITIATING` means a
 request may be in flight without a durable upload ID, and only `IN_PROGRESS` has an addressable MPU.
-An ambiguous initiation terminates that generation instead of guessing or adopting provider state.
+An ambiguous initiation terminates that generation and releases admission in one fenced transaction
+instead of guessing or adopting provider state; lease TTL is the process-death fallback.
 
 The M1 single-PUT path remains unchanged for files at or below 5,000,000,000 bytes. M2 does not
 change canonical manifests, DatasetVersion identity, Blob identity, READY meaning, pull, or the

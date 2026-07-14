@@ -30,11 +30,15 @@ Ruff, and mypy.
   whole-file SHA-256 verified before AVAILABLE.
 - One immutable request UUID maps to one response/session; invocation UUID and Blob-scoped session
   generation have distinct meanings. Terminal generations never reactivate.
-- UploadPart response ETags and normalized SHA-256 checksums are retained. ListParts verifies current
-  provider state but never supplies a missing completion receipt; receipt loss forces exact-part
-  re-upload. A supported provider must return the requested UploadPart checksum.
+- A complete `CompletedPartReceipt` retains part number plus the UploadPart response ETag and Base64
+  `ChecksumSHA256`. ListParts verifies current provider state but never supplies a missing receipt;
+  receipt loss forces exact-part re-upload. Complete sends both response fields for every part. A
+  supported provider must implement RoboLake's deliberately stricter checksum-enabled SHA-256
+  profile, even though AWS's general `CompletedPart` model makes checksum fields optional.
 - Completion returns 202, releases upload admission, and runs from PostgreSQL under a distinct
   heartbeat/fencing lease. Do not add Kafka, Celery, or another queue.
+- Existing completion idempotency is replayed before admission fencing. During provider completion
+  and full GET/hash, Blob remains `UPLOADING`; `VERIFYING` is only the short fenced evidence gate.
 - Provider upload ID is never an independent stable API field; it may appear only inside a presigned
   capability URL whose entire query, along with absolute paths, provider bodies, and credentials,
   is redacted from logs/errors/telemetry and never interpreted by the client.
@@ -220,7 +224,10 @@ overlapping range remain invalid.
 
 Add upload lease tests for idempotent acquire request, invocation binding, 64 abandoned/expired rows,
 atomic same-session takeover, monotonic epoch, current-owner renewal, stale-owner atomic SQL
-rejection, and database-time expiry. Add completion-lease tests for one claim, separate capacity,
+rejection, and database-time expiry. Also terminalize 64 `INITIATING` rows as
+`INITIATION_AMBIGUOUS` and prove each fenced transaction releases its slot immediately; prove stale
+owners cannot release another owner's lease and process death falls back to TTL. Add
+completion-lease tests for one claim, separate capacity,
 independent heartbeat, stale runner rejection, and takeover after expiry. Direct structural SQL tests
 must not claim that PostgreSQL independently knows the caller identity.
 
@@ -246,10 +253,10 @@ class UploadPartModel(Base):
     sha256: Mapped[str] = mapped_column(String(64))
     state: Mapped[str] = mapped_column(String(16))
     upload_response_etag: Mapped[str | None] = mapped_column(Text)
-    upload_response_checksum_sha256: Mapped[str | None] = mapped_column(String(64))
+    upload_response_checksum_sha256_base64: Mapped[str | None] = mapped_column(String(44))
     upload_response_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     listed_etag: Mapped[str | None] = mapped_column(Text)
-    listed_checksum_sha256: Mapped[str | None] = mapped_column(String(64))
+    listed_checksum_sha256_base64: Mapped[str | None] = mapped_column(String(44))
     listed_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     provider_listed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_capability_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -357,9 +364,13 @@ response with an embedded `<Error>` element through the adapter and assert it re
 than `CompleteOutcome.CREATED`. Preserve the negative
 unguarded-overwrite proof as a probe test that never runs against non-ephemeral buckets.
 
-Assert the adapter captures ETag/checksum from UploadPart success independently of ListParts. Add a
-contract test proving Complete receives ordered stored response ETags. A matching ListParts-only ETag
-must not satisfy the Complete input contract. Document this as AWS-official but not live-AWS-tested.
+Assert the adapter captures ETag and Base64 `ChecksumSHA256` from UploadPart success independently
+of ListParts. Add contract tests for deterministic expected-hex-to-provider-Base64 normalization and
+prove Complete receives ordered `CompletedPartReceipt` values containing PartNumber, stored response
+ETag, and stored response `ChecksumSHA256`. A matching ListParts-only observation or a receipt with
+either response field missing must not satisfy Complete. Different part numbers may share both
+fields. Document checksum support as AWS-documented but not live-AWS-tested, and clarify that
+RoboLake—not the general AWS API—makes the checksum receipt mandatory.
 
 - [ ] **Step 2: Define the port**
 
@@ -431,8 +442,10 @@ one active generation under race, new generation only after terminal attempt, an
 rebinding. Exercise `CREATED -> INITIATING -> IN_PROGRESS`, cancellation without provider call,
 abort rejection while INITIATING, response-loss ambiguity, best-effort known-ID abort, and no guessed
 upload ID. After initiating-owner lease loss, a new owner must terminalize ambiguity rather than
-repeat Create in that generation. Add 64 expired upload leases, one reacquisition winner, stale mutation failure, and late
-exact provider write reconciliation.
+repeat Create in that generation. Prove the current owner atomically terminalizes ambiguity and
+releases admission immediately; 64 such terminalizations return all capacity, a stale owner cannot
+release another owner's lease, and death before terminalization is recovered by TTL. Add 64 expired
+upload leases, one reacquisition winner, stale mutation failure, and late exact provider write reconciliation.
 
 - [ ] **Step 2: Write rolling-window tests**
 
@@ -460,8 +473,9 @@ Server recomputes canonical plan bytes/hash from Blob size and exactly one check
 first returns an AVAILABLE Blob unchanged, replays immutable request mapping, then binds/creates the
 active generation. Initiate commits `INITIATING` before provider I/O and stores ID before
 `IN_PROGRESS`. Confirm accepts an untrusted UploadPart response receipt, stores it, then calls
-ListParts; only equality with current provider facts makes VERIFIED. A ListParts-only match forces
-re-upload. Initial receipt-backed matches are reused; unambiguous current responses are new;
+ListParts; the receipt must contain response ETag plus Base64 `ChecksumSHA256`, and only equality with
+current provider facts makes VERIFIED. A ListParts-only match forces re-upload. Initial
+receipt-backed matches are reused; unambiguous current responses are new;
 ambiguous/later discoveries are reconciled. Capability issuance updates diagnostics only.
 
 - [ ] **Step 4: Verify and commit**
@@ -582,12 +596,22 @@ final absent with same MPU/valid subset taking guarded COMPLETING regression; an
 composite checksum matches the part plan but whole SHA differs; assert it never becomes AVAILABLE.
 Also make a `FINAL_PRESENT` object disappear before the read and prove same-MPU requeue or terminal
 new-generation handling without Complete under the stale adoption reason.
-Prove receipt validation requires both UploadPart response ETag and SHA-256 checksum, and Complete
-receives stored response ETags, never ListParts-only ETags. Hold provider
+Prove receipt validation requires both UploadPart response ETag and Base64 `ChecksumSHA256`, and
+Complete receives PartNumber plus both stored response fields for every ordered part, never
+ListParts-only observations. Missing response checksum prevents `VERIFIED`; normalize Base64 to the
+expected raw digest. Hold provider
 Complete and full GET longer than API/upload lease limits while independent completion heartbeats
 keep ownership. Kill a runner, expire/take over its completion lease, restart full verification at
 byte zero, and prove stale evidence/AVAILABLE/terminal writes cannot commit. Two runners racing must
-claim one row once.
+claim one row once. Prove Blob remains `UPLOADING` during Complete and full GET, transient GET failure
+leaves it `UPLOADING`, disappearance permits the guarded same-MPU recovery edge, success performs
+the short fenced `UPLOADING -> VERIFYING -> AVAILABLE` transaction, and mismatch performs
+`UPLOADING -> VERIFYING -> FAILED` without ever exposing `AVAILABLE`.
+
+Fault-inject completion acceptance after commit but before response, after lease release/expiry,
+after API restart, and after completion-runner takeover. Each matching request must replay the exact
+stored 202 before lease validation. Add same-request concurrent first execution and changed-payload
+`IDEMPOTENCY_CONFLICT` cases; the stored response must contain no capability or provider upload ID.
 
 - [ ] **Step 2: Verify red state**
 
@@ -599,11 +623,20 @@ Expected: failures show no durable acceptance/runner/completion-lease orchestrat
 
 ```python
 def accept_completion(
-    self, session_id: UUID, owner_id: UUID, epoch: int, request_id: UUID
+    self,
+    session_id: UUID,
+    owner_id: UUID,
+    epoch: int,
+    request_id: UUID,
+    request_hash: Sha256Digest,
 ) -> AcceptedCompletion:
+    replay = self.registry.find_completion_replay(request_id, request_hash)
+    if replay is not None:
+        return replay  # no lease or session inspection
+    self.registry.require_current_admission_fence(session_id, owner_id, epoch)
     reason = self._resolve_final_present_or_require_all_parts(session_id, owner_id, epoch)
-    return self.registry.accept_completion_and_release_upload_lease(
-        session_id, owner_id, epoch, request_id, reason
+    return self.registry.accept_completion_first_execution(
+        session_id, owner_id, epoch, request_id, request_hash, reason
     )
 
 def run_one_completion(self, owner_instance_id: UUID) -> bool:
@@ -614,17 +647,25 @@ def run_one_completion(self, owner_instance_id: UUID) -> bool:
     return True
 ```
 
-Acceptance atomically records `COMPLETING`/`PENDING_CLAIM`, releases upload admission, and yields HTTP
-202. The runner uses the same versioned artifact and PostgreSQL rows as its durable work registry;
+`find_completion_replay` returns the exact stored response on a matching hash and raises
+`IDEMPOTENCY_CONFLICT` on mismatch before any fence/session action. Only an absent record reaches
+first execution. Acceptance atomically records `COMPLETING`/`PENDING`, creates pending work, releases
+upload admission, and persists the canonical HTTP 202 response. A scope/request unique race makes
+the loser roll back and replay the winner. The runner uses the same versioned artifact and
+PostgreSQL rows as its durable work registry;
 do not introduce an external queue. Claim with `FOR UPDATE SKIP LOCKED` or equivalent, enforce
 separate completion concurrency, and heartbeat in short independent transactions at most TTL/3.
 
 `_reconcile_final_or_complete` checks AVAILABLE/final key first. It calls Complete only for
-`PARTS_READY`, supplying ordered stored UploadPart response ETags and `If-None-Match: *`;
+`PARTS_READY`, supplying ordered PartNumber, stored response ETag, stored response
+`ChecksumSHA256`, and `If-None-Match: *`;
 `FINAL_PRESENT` never pretends incomplete parts are resolved. If that final observation disappears,
 reconcile and requeue safely; a later Complete requires new `PARTS_READY` acceptance. It streams `iter_bytes` into SHA-256
-and only then records immutable `FULL_STREAM_SHA256` evidence and commits AVAILABLE+COMPLETED under
-the current completion fence. PostgreSQL checks evidence structure; integration tests prove the real
+while Blob remains `UPLOADING`. Only after a complete digest exists does one short fenced transaction
+record immutable `FULL_STREAM_SHA256` evidence, transition Blob
+`UPLOADING -> VERIFYING -> AVAILABLE`, commit session `COMPLETED`, and release completion ownership.
+Proven mismatch instead records evidence and performs `UPLOADING -> VERIFYING -> FAILED` plus terminal
+session failure. PostgreSQL checks evidence structure; integration tests prove the real
 read. On partial same-MPU non-409, take only the guarded recovery edge and release completion
 ownership so a CLI can reacquire upload admission. On 409/`NoSuchUpload` with absent final, terminate
 the generation; a later new request creates generation+1 with no adopted receipts. On 412, verify the
@@ -635,7 +676,8 @@ existing final. On mismatch, stop without delete/overwrite.
 The fake iterator records offsets/chunks; live test corrupts one byte and asserts exit path 5. Assert
 an AVAILABLE Blob performs zero provider reads and a new multipart Blob performs one full read.
 Interrupted verification plus takeover performs a second read from byte zero; it never resumes by
-Range or persists live byte progress.
+Range or persists live byte progress. A partial or transiently failed read writes no evidence and
+does not move Blob from `UPLOADING`.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -676,7 +718,9 @@ Assert strict unknown-field rejection, UUID request/invocation fields, max windo
 provider-upload-ID field, UploadPart response receipt accepted only by confirm (never complete),
 stable initiation/admission errors, and query-canary absence from logs. Assert upload mutations carry
 owner/epoch, status requires no lease, Complete returns replayable 202, and the client treats each
-capability URL as opaque.
+capability URL as opaque. Assert existing completion idempotency lookup and hash validation happen
+before admission fencing; exact stored 202 replays after lease release/expiry, restart, and runner
+takeover, while a changed request hash returns `IDEMPOTENCY_CONFLICT` without session mutation.
 
 - [ ] **Step 2: Implement strict schemas and routes**
 
@@ -836,10 +880,14 @@ git commit -m "docs(m2): add multipart evidence and guidance"
   every interface; request/session identities are never rebound/reactivated.
 - `CREATED`/`INITIATING` makes provider creation ambiguity explicit; abort never guesses an upload ID.
 - `UploadPart` has no ISSUED state; capability metadata never advances progress.
-- Complete uses retained UploadPart response ETags; ListParts-only observations never manufacture a
-  receipt and response loss triggers safe exact-part retransmission.
+- Complete uses retained UploadPart response ETag and `ChecksumSHA256` for every ordered PartNumber;
+  ListParts-only observations never manufacture a receipt and response loss triggers safe exact-part
+  retransmission.
 - Completion is 202/durable/server-owned, releases upload admission, uses PostgreSQL rather than an
-  external queue, heartbeats long I/O, and fences stale runner commits.
+  external queue, heartbeats long I/O, and fences stale runner commits. Replay precedes admission
+  fencing, and Blob stays `UPLOADING` until the short evidence-publication transaction.
+- `INITIATION_AMBIGUOUS` terminalization atomically releases admission under the current fence, with
+  TTL only as the process-death fallback.
 - 409/NoSuchUpload full restart cannot adopt any old provider part; guarded same-MPU recovery is
   limited to the documented non-409 partial case.
 - Newly transferred, reused, and reconciled invocation metrics are disjoint and never claim wire
