@@ -1,6 +1,6 @@
 # ADR 0009: Multipart Final Publication
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context

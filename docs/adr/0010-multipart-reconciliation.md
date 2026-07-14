@@ -1,6 +1,6 @@
 # ADR 0010: Multipart Reconciliation
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context
