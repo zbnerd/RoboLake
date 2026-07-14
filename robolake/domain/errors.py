@@ -153,3 +153,75 @@ class UnsupportedFilesystemError(RoboLakeError):
     """Raised when atomic no-replace directory publication is unavailable."""
 
     code = "UNSUPPORTED_FILESYSTEM"
+
+
+class LocalFileChangedError(RoboLakeError):
+    """Raised when a resumed source no longer proves the sealed Blob."""
+
+    code = "LOCAL_FILE_CHANGED"
+
+
+class InvalidPartNumberError(RoboLakeError):
+    """Raised when a part number is outside the frozen plan."""
+
+    code = "INVALID_PART_NUMBER"
+
+
+class PartSizeMismatchError(RoboLakeError):
+    """Raised when provider part size differs from the frozen plan."""
+
+    code = "PART_SIZE_MISMATCH"
+
+
+class PartChecksumRejectedError(RoboLakeError):
+    """Raised when a part checksum is invalid or rejected."""
+
+    code = "PART_CHECKSUM_REJECTED"
+
+
+class MultipartSessionNotFoundError(RoboLakeError):
+    """Raised when the provider attempt is absent and no final object resolves it."""
+
+    code = "MULTIPART_SESSION_NOT_FOUND"
+
+
+class AdmissionLeaseHeldError(RoboLakeError):
+    """Raised when another unexpired invocation owns upload admission."""
+
+    code = "ADMISSION_LEASE_HELD"
+
+
+class AdmissionCapacityExhaustedError(RoboLakeError):
+    """Raised when all multipart upload admission slots are active."""
+
+    code = "ADMISSION_CAPACITY_EXHAUSTED"
+
+
+class AdmissionLeaseLostError(RoboLakeError):
+    """Raised when an upload mutation no longer owns the current fence."""
+
+    code = "ADMISSION_LEASE_LOST"
+
+
+class MultipartInitiationInProgressError(RoboLakeError):
+    """Raised when provider initiation has no durable addressable outcome yet."""
+
+    code = "MULTIPART_INITIATION_IN_PROGRESS"
+
+
+class MultipartInitiationAmbiguousError(RoboLakeError):
+    """Raised when provider initiation may have succeeded without a durable ID."""
+
+    code = "MULTIPART_INITIATION_AMBIGUOUS"
+
+
+class MultipartCompletionAmbiguousError(RoboLakeError):
+    """Raised when multipart completion has no proven final outcome yet."""
+
+    code = "MULTIPART_COMPLETION_AMBIGUOUS"
+
+
+class FinalBlobPublicationConflictError(RoboLakeError):
+    """Raised when conditional final publication requires reconciliation."""
+
+    code = "FINAL_BLOB_PUBLICATION_CONFLICT"

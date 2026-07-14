@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from uuid import UUID
+import hashlib
+import json
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from robolake.application.contracts import UploadContext
 from robolake.domain.errors import (
+    AdmissionCapacityExhaustedError,
+    AdmissionLeaseHeldError,
+    AdmissionLeaseLostError,
     ContentConflictError,
     IdempotencyConflictError,
     IllegalTransitionError,
+    InvalidPartNumberError,
     ManifestMismatchError,
     NotFoundError,
+    PartChecksumRejectedError,
+    PartSizeMismatchError,
 )
 from robolake.domain.identifiers import (
     DatasetName,
@@ -31,12 +40,44 @@ from robolake.domain.lifecycle import (
     VersionState,
 )
 from robolake.domain.manifest import Manifest, ManifestEntry
+from robolake.domain.multipart import (
+    AdmissionLeaseEpoch,
+    AdmissionLeaseOwnerId,
+    CompletedPartReceipt,
+    CompletionLeaseEpoch,
+    CompletionLeaseOwnerId,
+    CompletionPhase,
+    CompletionRecoveryAction,
+    CompletionRecoveryReason,
+    MultipartInvocationId,
+    MultipartSessionGeneration,
+    MultipartSessionId,
+    MultipartSessionState,
+    PartAttribution,
+    PartDefinition,
+    PartPlan,
+    UploadPartState,
+    require_completion_phase_transition,
+)
 from robolake.domain.records import (
+    AcceptedCompletion,
+    AdmissionLeaseRecord,
     BlobRecord,
+    CompletionClaim,
+    CompletionLeaseRecord,
+    CompletionRecoveryResult,
     ContentStatus,
     DatasetRecord,
+    HashedMultipartPlan,
+    MultipartUploadContext,
+    MultipartUploadSessionRecord,
+    PartialCompletionEvidence,
+    PartReconciliationResult,
+    ProviderPartObservation,
     SnapshotStatus,
+    UploadPartRecord,
     UploadSessionRecord,
+    VerificationEvidence,
     VersionRecord,
     VersionStatus,
 )
@@ -46,6 +87,9 @@ from robolake.infrastructure.models import (
     DatasetModel,
     DatasetVersionModel,
     IdempotencyRecordModel,
+    MultipartAdmissionLeaseModel,
+    MultipartCompletionLeaseModel,
+    UploadPartModel,
     UploadSessionModel,
 )
 
@@ -352,6 +396,7 @@ class SqlAlchemyStore:
                 upload = session.get(UploadSessionModel, replay.resource_id)
                 if upload is None:
                     raise IdempotencyConflictError("Idempotency upload session is unavailable.")
+                _require_single_put_session(upload)
                 return _upload_context(version, dataset.name, blob, upload)
 
             upload = session.scalar(
@@ -382,6 +427,7 @@ class SqlAlchemyStore:
                 )
             if upload is None:
                 raise ContentConflictError("Blob state has no recoverable upload session.")
+            _require_single_put_session(upload)
             session.add(
                 IdempotencyRecordModel(
                     scope="upload-session-create",
@@ -401,6 +447,7 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id)
             if upload is None:
                 raise NotFoundError("UploadSession does not exist.")
+            _require_single_put_session(upload)
             return self._load_upload_context(session, upload)
 
     def mark_upload_in_progress(self, session_id: UUID) -> UploadContext:
@@ -409,6 +456,7 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id, with_for_update=True)
             if upload is None:
                 raise NotFoundError("UploadSession does not exist.")
+            _require_single_put_session(upload)
             blob = session.get(BlobModel, upload.blob_id, with_for_update=True)
             version = session.get(
                 DatasetVersionModel,
@@ -440,6 +488,7 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id, with_for_update=True)
             if upload is None:
                 raise NotFoundError("UploadSession does not exist.")
+            _require_single_put_session(upload)
             blob = session.get(BlobModel, upload.blob_id, with_for_update=True)
             version = session.get(DatasetVersionModel, upload.initiating_version_id)
             if blob is None or version is None:
@@ -474,6 +523,7 @@ class SqlAlchemyStore:
             upload = session.get(UploadSessionModel, session_id, with_for_update=True)
             if upload is None:
                 raise NotFoundError("UploadSession does not exist.")
+            _require_single_put_session(upload)
             blob = session.get(BlobModel, upload.blob_id, with_for_update=True)
             version = session.get(
                 DatasetVersionModel,
@@ -553,7 +603,17 @@ class SqlAlchemyStore:
                 prior = session.get(UploadSessionModel, replay.resource_id)
                 if prior is None:
                     raise IdempotencyConflictError("Idempotency upload session is unavailable.")
+                _require_single_put_session(prior)
                 return _upload_context(version, dataset.name, blob, prior)
+            prior = session.scalar(
+                select(UploadSessionModel)
+                .where(UploadSessionModel.blob_id == blob_id)
+                .order_by(UploadSessionModel.created_at.desc())
+                .with_for_update()
+                .limit(1)
+            )
+            if prior is not None:
+                _require_single_put_session(prior)
             if version.state != VersionState.FAILED.value or blob.state != BlobState.FAILED.value:
                 raise IllegalTransitionError("Only a failed Blob and Version can be restarted.")
             version.state = VersionState.UPLOADING.value
@@ -628,7 +688,856 @@ class SqlAlchemyStore:
             session.flush()
             return _version_record(version, dataset.name)
 
+    def create_or_resolve_multipart(
+        self,
+        request_id: UUID,
+        version_id: UUID,
+        blob_id: UUID,
+        plan: HashedMultipartPlan,
+    ) -> MultipartUploadContext:
+        """Create one generation-numbered plan or replay its immutable binding."""
+        request_sha256 = _multipart_request_sha256(
+            "multipart-session-resolve",
+            str(version_id),
+            str(blob_id),
+            plan.sha256.value,
+        )
+        key = str(request_id)
+        with self._sessions.begin() as session:
+            _lock_multipart_request(session, "multipart-session-resolve", key)
+            replay = session.get(
+                IdempotencyRecordModel,
+                {"scope": "multipart-session-resolve", "key": key},
+            )
+            if replay is not None:
+                return self._replay_multipart_context(session, replay, request_sha256)
+
+            blob = session.get(BlobModel, blob_id, with_for_update=True)
+            version = session.get(DatasetVersionModel, version_id)
+            if blob is None or version is None:
+                raise NotFoundError("Multipart Blob or initiating DatasetVersion does not exist.")
+            is_referenced = session.scalar(
+                select(func.count())
+                .select_from(DatasetEntryModel)
+                .where(
+                    DatasetEntryModel.dataset_version_id == version_id,
+                    DatasetEntryModel.blob_id == blob_id,
+                )
+            )
+            if not is_referenced:
+                raise NotFoundError("Blob is not referenced by the initiating DatasetVersion.")
+            if blob.size_bytes != plan.plan.blob_size_bytes:
+                raise ContentConflictError("PartPlan size differs from immutable Blob size.")
+
+            active_states = tuple(
+                state.value
+                for state in (
+                    MultipartSessionState.CREATED,
+                    MultipartSessionState.INITIATING,
+                    MultipartSessionState.IN_PROGRESS,
+                    MultipartSessionState.COMPLETING,
+                    MultipartSessionState.ABORTING,
+                )
+            )
+            upload = session.scalar(
+                select(UploadSessionModel)
+                .where(
+                    UploadSessionModel.blob_id == blob_id,
+                    UploadSessionModel.state.in_(active_states),
+                )
+                .with_for_update()
+            )
+            if upload is not None:
+                if upload.strategy != "MULTIPART" or upload.part_plan_sha256 != plan.sha256.value:
+                    raise ContentConflictError(
+                        "Active upload does not match the deterministic plan."
+                    )
+            else:
+                generation = session.scalar(
+                    select(
+                        func.coalesce(func.max(UploadSessionModel.session_generation), 0) + 1
+                    ).where(UploadSessionModel.blob_id == blob_id)
+                )
+                if generation is None:
+                    raise ContentConflictError("Could not allocate a multipart generation.")
+                now = datetime.now(UTC)
+                upload = UploadSessionModel(
+                    blob_id=blob_id,
+                    initiating_version_id=version_id,
+                    strategy="MULTIPART",
+                    state=MultipartSessionState.CREATED.value,
+                    session_generation=generation,
+                    part_size_bytes=plan.plan.part_size_bytes,
+                    planned_part_count=plan.plan.part_count,
+                    part_plan_schema_version=plan.plan.schema_version,
+                    part_plan_sha256=plan.sha256.value,
+                    created_at=now,
+                    last_activity_at=now,
+                )
+                session.add(upload)
+                session.flush()
+                session.add_all(
+                    UploadPartModel(
+                        upload_session_id=upload.id,
+                        part_number=part.part_number,
+                        offset_bytes=part.offset_bytes,
+                        size_bytes=part.size_bytes,
+                        sha256=part.expected_sha256.value,
+                        state=UploadPartState.PENDING.value,
+                        capability_issue_count=0,
+                        created_at=now,
+                    )
+                    for part in plan.plan.parts
+                )
+                session.flush()
+
+            session.add(
+                IdempotencyRecordModel(
+                    scope="multipart-session-resolve",
+                    key=key,
+                    request_sha256=request_sha256,
+                    resource_type="upload-session",
+                    resource_id=upload.id,
+                    http_status=200,
+                    response_json={"session_id": str(upload.id)},
+                )
+            )
+            session.flush()
+            return self._load_multipart_context(session, upload)
+
+    def get_multipart(self, session_id: UUID) -> MultipartUploadContext:
+        """Read one multipart attempt and its frozen PartPlan."""
+        with self._sessions() as session:
+            upload = session.get(UploadSessionModel, session_id)
+            if upload is None or upload.strategy != "MULTIPART":
+                raise NotFoundError("Multipart session does not exist.")
+            return self._load_multipart_context(session, upload)
+
+    def acquire_multipart_lease(
+        self,
+        request_id: UUID,
+        invocation_id: UUID,
+        session_id: UUID,
+        ttl_seconds: int,
+        capacity: int,
+    ) -> AdmissionLeaseRecord:
+        """Acquire, renew, or take over upload admission under one global DB fence."""
+        if ttl_seconds <= 0 or capacity <= 0:
+            raise ContentConflictError("Lease TTL and admission capacity must be positive.")
+        request_sha256 = _multipart_request_sha256(
+            "multipart-admission-acquire",
+            str(session_id),
+            str(invocation_id),
+        )
+        key = str(request_id)
+        with self._sessions.begin() as session:
+            _lock_multipart_request(session, "multipart-admission-acquire", key)
+            replay = session.get(
+                IdempotencyRecordModel,
+                {"scope": "multipart-admission-acquire", "key": key},
+            )
+            if replay is not None:
+                return _replay_admission_lease(replay, request_sha256)
+
+            session.execute(text("SELECT pg_advisory_xact_lock(782341902115)"))
+            upload = session.get(UploadSessionModel, session_id, with_for_update=True)
+            if upload is None or upload.strategy != "MULTIPART":
+                raise NotFoundError("Multipart session does not exist.")
+            if upload.state not in {
+                MultipartSessionState.CREATED.value,
+                MultipartSessionState.INITIATING.value,
+                MultipartSessionState.IN_PROGRESS.value,
+            }:
+                raise IllegalTransitionError(
+                    "Multipart admission is limited to upload-owned session states."
+                )
+
+            now = session.scalar(select(func.clock_timestamp()))
+            if not isinstance(now, datetime):
+                raise ContentConflictError("Database time is unavailable.")
+            lease = session.get(MultipartAdmissionLeaseModel, session_id, with_for_update=True)
+            if lease is not None and lease.expires_at > now:
+                if lease.invocation_id != invocation_id:
+                    raise AdmissionLeaseHeldError("Another invocation owns multipart admission.")
+                lease.renewed_at = now
+                lease.expires_at = now + timedelta(seconds=ttl_seconds)
+            else:
+                active_count = session.scalar(
+                    select(func.count())
+                    .select_from(MultipartAdmissionLeaseModel)
+                    .where(MultipartAdmissionLeaseModel.expires_at > now)
+                )
+                if active_count is None or active_count >= capacity:
+                    raise AdmissionCapacityExhaustedError(
+                        "Multipart admission capacity is exhausted."
+                    )
+                owner_id = uuid4()
+                if lease is None:
+                    lease = MultipartAdmissionLeaseModel(
+                        upload_session_id=session_id,
+                        invocation_id=invocation_id,
+                        owner_id=owner_id,
+                        epoch=1,
+                        acquired_at=now,
+                        renewed_at=now,
+                        expires_at=now + timedelta(seconds=ttl_seconds),
+                    )
+                    session.add(lease)
+                else:
+                    lease.invocation_id = invocation_id
+                    lease.owner_id = owner_id
+                    lease.epoch += 1
+                    lease.acquired_at = now
+                    lease.renewed_at = now
+                    lease.expires_at = now + timedelta(seconds=ttl_seconds)
+            session.flush()
+            result = _admission_lease_record(lease)
+            session.add(
+                IdempotencyRecordModel(
+                    scope="multipart-admission-acquire",
+                    key=key,
+                    request_sha256=request_sha256,
+                    resource_type="upload-session",
+                    resource_id=session_id,
+                    http_status=200,
+                    response_json={
+                        "session_id": str(session_id),
+                        "invocation_id": str(invocation_id),
+                        "owner_id": str(result.lease_owner_id.value),
+                        "epoch": result.lease_epoch.value,
+                        "expires_at": result.expires_at.isoformat(),
+                        "renewed_at": result.last_renewed_at.isoformat(),
+                    },
+                )
+            )
+            return result
+
+    def release_multipart_lease(self, session_id: UUID, owner_id: UUID, epoch: int) -> None:
+        """End current upload admission without deleting its fencing history."""
+        with self._sessions.begin() as session:
+            released = session.execute(
+                text(
+                    "UPDATE multipart_admission_leases "
+                    "SET renewed_at = clock_timestamp(), expires_at = clock_timestamp() "
+                    "WHERE upload_session_id = :session_id AND owner_id = :owner_id "
+                    "AND epoch = :epoch AND expires_at > clock_timestamp() RETURNING upload_session_id"
+                ),
+                {"session_id": session_id, "owner_id": owner_id, "epoch": epoch},
+            ).scalar_one_or_none()
+            if released is None:
+                raise AdmissionLeaseLostError("Multipart admission lease is no longer current.")
+
+    def begin_provider_initiation(self, session_id: UUID, owner_id: UUID, epoch: int) -> None:
+        """Commit initiation intent under the current upload fence."""
+        with self._sessions.begin() as session:
+            changed = session.execute(
+                text(
+                    "UPDATE upload_sessions SET state = 'INITIATING', "
+                    "initiation_started_at = clock_timestamp(), last_activity_at = clock_timestamp() "
+                    "WHERE id = :session_id AND state = 'CREATED' AND EXISTS ("
+                    "SELECT 1 FROM multipart_admission_leases lease "
+                    "WHERE lease.upload_session_id = upload_sessions.id "
+                    "AND lease.owner_id = :owner_id AND lease.epoch = :epoch "
+                    "AND lease.expires_at > clock_timestamp()) RETURNING id"
+                ),
+                {"session_id": session_id, "owner_id": owner_id, "epoch": epoch},
+            ).scalar_one_or_none()
+            if changed is None:
+                raise AdmissionLeaseLostError("Current admission fence could not begin initiation.")
+
+    def record_provider_upload(
+        self, session_id: UUID, owner_id: UUID, epoch: int, provider_upload_id: str
+    ) -> None:
+        """Persist the opaque provider attempt ID under the current upload fence."""
+        if not provider_upload_id:
+            raise ContentConflictError("Provider upload ID must not be empty.")
+        with self._sessions.begin() as session:
+            blob_id = session.execute(
+                text(
+                    "UPDATE upload_sessions SET state = 'IN_PROGRESS', "
+                    "provider_upload_id = :provider_upload_id, last_activity_at = clock_timestamp() "
+                    "WHERE id = :session_id AND state = 'INITIATING' AND EXISTS ("
+                    "SELECT 1 FROM multipart_admission_leases lease "
+                    "WHERE lease.upload_session_id = upload_sessions.id "
+                    "AND lease.owner_id = :owner_id AND lease.epoch = :epoch "
+                    "AND lease.expires_at > clock_timestamp()) RETURNING blob_id"
+                ),
+                {
+                    "session_id": session_id,
+                    "owner_id": owner_id,
+                    "epoch": epoch,
+                    "provider_upload_id": provider_upload_id,
+                },
+            ).scalar_one_or_none()
+            if blob_id is None:
+                raise AdmissionLeaseLostError(
+                    "Current admission fence could not record initiation."
+                )
+            blob = session.get(BlobModel, blob_id, with_for_update=True)
+            if blob is None:
+                raise ContentConflictError("Multipart Blob is unavailable.")
+            if blob.state == BlobState.PENDING.value:
+                blob.state = BlobState.UPLOADING.value
+                session.flush()
+            elif blob.state != BlobState.UPLOADING.value:
+                raise IllegalTransitionError("Multipart initiation requires a pending Blob.")
+
+    def record_uploaded_part(
+        self,
+        session_id: UUID,
+        owner_id: UUID,
+        epoch: int,
+        receipt: CompletedPartReceipt,
+    ) -> UploadPartRecord:
+        """Persist one successful UploadPart response under the current upload fence."""
+        with self._sessions.begin() as session:
+            current = session.execute(
+                text(
+                    "UPDATE upload_sessions SET last_activity_at = clock_timestamp() "
+                    "WHERE id = :session_id AND state = 'IN_PROGRESS' AND EXISTS ("
+                    "SELECT 1 FROM multipart_admission_leases lease "
+                    "WHERE lease.upload_session_id = upload_sessions.id "
+                    "AND lease.owner_id = :owner_id AND lease.epoch = :epoch "
+                    "AND lease.expires_at > clock_timestamp()) RETURNING id"
+                ),
+                {"session_id": session_id, "owner_id": owner_id, "epoch": epoch},
+            ).scalar_one_or_none()
+            if current is None:
+                raise AdmissionLeaseLostError("Stale owner cannot confirm an uploaded Part.")
+            part = session.get(
+                UploadPartModel,
+                {"upload_session_id": session_id, "part_number": receipt.part_number},
+                with_for_update=True,
+            )
+            if part is None:
+                raise InvalidPartNumberError("Part is not present in the frozen PartPlan.")
+            expected = Sha256Digest.parse(part.sha256)
+            receipt.validate_for(expected)
+            has_any_receipt_field = (
+                part.upload_response_etag is not None
+                or part.upload_response_checksum_sha256_base64 is not None
+                or part.upload_response_received_at is not None
+                or part.uploaded_at is not None
+            )
+            existing = _upload_part_record(part).response_receipt
+            if has_any_receipt_field:
+                if existing is None:
+                    raise ContentConflictError(
+                        "Stored UploadPart receipt is structurally incomplete."
+                    )
+                if existing != receipt:
+                    raise ContentConflictError("UploadPart response receipt is immutable.")
+                return _upload_part_record(part)
+            now = session.scalar(select(func.clock_timestamp()))
+            if not isinstance(now, datetime):
+                raise ContentConflictError("Database time is unavailable.")
+            part.state = UploadPartState.UPLOADED.value
+            part.upload_response_etag = receipt.response_etag
+            part.upload_response_checksum_sha256_base64 = receipt.response_checksum_sha256_base64
+            part.upload_response_received_at = now
+            part.uploaded_at = now
+            session.flush()
+            return _upload_part_record(part)
+
+    def reconcile_parts(
+        self,
+        session_id: UUID,
+        owner_id: UUID,
+        epoch: int,
+        provider_parts: Sequence[ProviderPartObservation],
+        attribution: PartAttribution,
+    ) -> PartReconciliationResult:
+        """Reconcile one complete ListParts observation without manufacturing receipts."""
+        observations = {part.part_number: part for part in provider_parts}
+        if len(observations) != len(provider_parts):
+            raise ContentConflictError("Provider Part observations contain duplicate numbers.")
+        with self._sessions.begin() as session:
+            current = session.execute(
+                text(
+                    "UPDATE upload_sessions SET last_provider_reconciled_at = clock_timestamp(), "
+                    "last_activity_at = clock_timestamp() WHERE id = :session_id "
+                    "AND state = 'IN_PROGRESS' AND EXISTS (SELECT 1 "
+                    "FROM multipart_admission_leases lease "
+                    "WHERE lease.upload_session_id = upload_sessions.id "
+                    "AND lease.owner_id = :owner_id AND lease.epoch = :epoch "
+                    "AND lease.expires_at > clock_timestamp()) RETURNING id"
+                ),
+                {"session_id": session_id, "owner_id": owner_id, "epoch": epoch},
+            ).scalar_one_or_none()
+            if current is None:
+                raise AdmissionLeaseLostError("Stale owner cannot reconcile multipart Parts.")
+            models = session.scalars(
+                select(UploadPartModel)
+                .where(UploadPartModel.upload_session_id == session_id)
+                .order_by(UploadPartModel.part_number)
+                .with_for_update()
+            ).all()
+            planned_numbers = {part.part_number for part in models}
+            unknown_numbers = set(observations) - planned_numbers
+            if unknown_numbers:
+                raise InvalidPartNumberError(
+                    "Provider returned a Part outside the frozen PartPlan."
+                )
+            reconciled_at = session.scalar(select(func.clock_timestamp()))
+            if not isinstance(reconciled_at, datetime):
+                raise ContentConflictError("Database time is unavailable.")
+
+            newly_resolved: list[UploadPartModel] = []
+            for part in models:
+                was_verified = part.state == UploadPartState.VERIFIED.value
+                observation = observations.get(part.part_number)
+                if not _apply_provider_part_observation(part, observation, reconciled_at):
+                    if part.state != UploadPartState.PENDING.value:
+                        part.state = UploadPartState.PENDING.value
+                else:
+                    if part.state == UploadPartState.PENDING.value:
+                        part.state = UploadPartState.UPLOADED.value
+                    if not was_verified:
+                        newly_resolved.append(part)
+            session.flush()
+            for part in newly_resolved:
+                part.state = UploadPartState.VERIFIED.value
+                if part.provider_listed_at is None:
+                    raise ContentConflictError("VERIFIED Part lacks provider observation time.")
+                part.verified_at = part.provider_listed_at
+            session.flush()
+            return PartReconciliationResult(
+                attribution=attribution,
+                resolved_part_count=len(newly_resolved),
+                resolved_part_bytes=sum(part.size_bytes for part in newly_resolved),
+            )
+
+    def mark_multipart_initiation_ambiguous(
+        self, session_id: UUID, owner_id: UUID, epoch: int
+    ) -> None:
+        """Terminalize ambiguous initiation and release capacity atomically."""
+        with self._sessions.begin() as session:
+            changed = session.execute(
+                text(
+                    "UPDATE upload_sessions SET state = 'FAILED', "
+                    "failure_code = 'INITIATION_AMBIGUOUS', "
+                    "initiation_ambiguous_at = clock_timestamp(), completed_at = clock_timestamp(), "
+                    "last_activity_at = clock_timestamp() "
+                    "WHERE id = :session_id AND state = 'INITIATING' AND EXISTS ("
+                    "SELECT 1 FROM multipart_admission_leases lease "
+                    "WHERE lease.upload_session_id = upload_sessions.id "
+                    "AND lease.owner_id = :owner_id AND lease.epoch = :epoch "
+                    "AND lease.expires_at > clock_timestamp()) RETURNING id"
+                ),
+                {"session_id": session_id, "owner_id": owner_id, "epoch": epoch},
+            ).scalar_one_or_none()
+            if changed is None:
+                raise AdmissionLeaseLostError(
+                    "Stale owner cannot terminalize multipart initiation."
+                )
+            released = session.execute(
+                text(
+                    "UPDATE multipart_admission_leases "
+                    "SET renewed_at = clock_timestamp(), expires_at = clock_timestamp() "
+                    "WHERE upload_session_id = :session_id AND owner_id = :owner_id "
+                    "AND epoch = :epoch RETURNING upload_session_id"
+                ),
+                {"session_id": session_id, "owner_id": owner_id, "epoch": epoch},
+            ).scalar_one_or_none()
+            if released is None:
+                raise AdmissionLeaseLostError("Admission release lost its current fence.")
+
+    def accept_completion(
+        self,
+        session_id: UUID,
+        owner_id: UUID,
+        epoch: int,
+        request_id: UUID,
+    ) -> AcceptedCompletion:
+        """Durably accept completion, replaying idempotency before lease fencing."""
+        request_sha256 = _multipart_request_sha256(
+            "multipart-completion-accept",
+            str(session_id),
+        )
+        key = str(request_id)
+        with self._sessions.begin() as session:
+            _lock_multipart_request(session, "multipart-completion-accept", key)
+            replay = session.get(
+                IdempotencyRecordModel,
+                {"scope": "multipart-completion-accept", "key": key},
+            )
+            if replay is not None:
+                return _replay_accepted_completion(replay, request_sha256, request_id)
+
+            upload = session.get(UploadSessionModel, session_id, with_for_update=True)
+            replay = session.get(
+                IdempotencyRecordModel,
+                {"scope": "multipart-completion-accept", "key": key},
+            )
+            if replay is not None:
+                return _replay_accepted_completion(replay, request_sha256, request_id)
+            if upload is None or upload.strategy != "MULTIPART":
+                raise NotFoundError("Multipart session does not exist.")
+            current_lease = session.scalar(
+                select(MultipartAdmissionLeaseModel).where(
+                    MultipartAdmissionLeaseModel.upload_session_id == session_id,
+                    MultipartAdmissionLeaseModel.owner_id == owner_id,
+                    MultipartAdmissionLeaseModel.epoch == epoch,
+                    MultipartAdmissionLeaseModel.expires_at > func.clock_timestamp(),
+                )
+            )
+            if current_lease is None:
+                raise AdmissionLeaseLostError("Completion acceptance lost upload admission.")
+            unresolved = session.scalar(
+                select(func.count())
+                .select_from(UploadPartModel)
+                .where(
+                    UploadPartModel.upload_session_id == session_id,
+                    UploadPartModel.state != UploadPartState.VERIFIED.value,
+                )
+            )
+            if upload.state != MultipartSessionState.IN_PROGRESS.value or unresolved:
+                raise IllegalTransitionError("Completion requires every planned Part VERIFIED.")
+            now = session.scalar(select(func.clock_timestamp()))
+            if not isinstance(now, datetime):
+                raise ContentConflictError("Database time is unavailable.")
+            upload.state = MultipartSessionState.COMPLETING.value
+            upload.completion_requested_at = now
+            upload.completion_reason = "PARTS_READY"
+            upload.completion_phase = CompletionPhase.PENDING.value
+            upload.last_activity_at = now
+            current_lease.renewed_at = now
+            current_lease.expires_at = now
+            response = {"session_id": str(session_id), "state": "COMPLETING"}
+            session.add(
+                IdempotencyRecordModel(
+                    scope="multipart-completion-accept",
+                    key=key,
+                    request_sha256=request_sha256,
+                    resource_type="upload-session",
+                    resource_id=session_id,
+                    http_status=202,
+                    response_json=response,
+                )
+            )
+            session.flush()
+            return AcceptedCompletion(
+                request_id=request_id,
+                session_id=MultipartSessionId(session_id),
+            )
+
+    def claim_completion(
+        self, owner_instance_id: UUID, ttl_seconds: int, capacity: int
+    ) -> CompletionClaim | None:
+        """Claim one durable completion row with a separate server-side fence."""
+        if ttl_seconds <= 0 or capacity <= 0:
+            raise ContentConflictError("Completion TTL and capacity must be positive.")
+        with self._sessions.begin() as session:
+            session.execute(text("SELECT pg_advisory_xact_lock(782341902116)"))
+            now = session.scalar(select(func.clock_timestamp()))
+            if not isinstance(now, datetime):
+                raise ContentConflictError("Database time is unavailable.")
+            active_count = session.scalar(
+                select(func.count())
+                .select_from(MultipartCompletionLeaseModel)
+                .where(MultipartCompletionLeaseModel.expires_at > now)
+            )
+            if active_count is None or active_count >= capacity:
+                return None
+            upload = session.scalar(
+                select(UploadSessionModel)
+                .outerjoin(
+                    MultipartCompletionLeaseModel,
+                    MultipartCompletionLeaseModel.upload_session_id == UploadSessionModel.id,
+                )
+                .where(
+                    UploadSessionModel.strategy == "MULTIPART",
+                    UploadSessionModel.state == MultipartSessionState.COMPLETING.value,
+                    or_(
+                        MultipartCompletionLeaseModel.upload_session_id.is_(None),
+                        MultipartCompletionLeaseModel.expires_at <= now,
+                    ),
+                )
+                .order_by(UploadSessionModel.completion_requested_at, UploadSessionModel.id)
+                .with_for_update(of=UploadSessionModel, skip_locked=True)
+                .limit(1)
+            )
+            if upload is None:
+                return None
+            lease = session.get(MultipartCompletionLeaseModel, upload.id, with_for_update=True)
+            if lease is None:
+                lease = MultipartCompletionLeaseModel(
+                    upload_session_id=upload.id,
+                    owner_instance_id=owner_instance_id,
+                    epoch=1,
+                    acquired_at=now,
+                    renewed_at=now,
+                    expires_at=now + timedelta(seconds=ttl_seconds),
+                )
+                session.add(lease)
+            else:
+                lease.owner_instance_id = owner_instance_id
+                lease.epoch += 1
+                lease.acquired_at = now
+                lease.renewed_at = now
+                lease.expires_at = now + timedelta(seconds=ttl_seconds)
+            session.flush()
+            if upload.completion_phase is None:
+                raise ContentConflictError("Completion work has no durable phase.")
+            lease_record = _completion_lease_record(lease)
+            return CompletionClaim(
+                session_id=MultipartSessionId(upload.id),
+                lease=lease_record,
+                phase=CompletionPhase(upload.completion_phase),
+            )
+
+    def renew_completion_lease(
+        self,
+        session_id: UUID,
+        owner_instance_id: UUID,
+        epoch: int,
+        ttl_seconds: int,
+    ) -> CompletionLeaseRecord:
+        """Heartbeat only the current unexpired completion owner."""
+        if ttl_seconds <= 0:
+            raise ContentConflictError("Completion lease TTL must be positive.")
+        with self._sessions.begin() as session:
+            row = session.execute(
+                text(
+                    "UPDATE multipart_completion_leases SET renewed_at = clock_timestamp(), "
+                    "expires_at = clock_timestamp() + make_interval(secs => :ttl_seconds) "
+                    "WHERE upload_session_id = :session_id "
+                    "AND owner_instance_id = :owner_id AND epoch = :epoch "
+                    "AND expires_at > clock_timestamp() "
+                    "RETURNING upload_session_id, owner_instance_id, epoch, acquired_at, "
+                    "renewed_at, expires_at"
+                ),
+                {
+                    "session_id": session_id,
+                    "owner_id": owner_instance_id,
+                    "epoch": epoch,
+                    "ttl_seconds": ttl_seconds,
+                },
+            ).one_or_none()
+            if row is None:
+                raise AdmissionLeaseLostError("Completion lease is no longer current.")
+            return CompletionLeaseRecord(
+                session_id=MultipartSessionId(row.upload_session_id),
+                lease_owner_id=CompletionLeaseOwnerId(row.owner_instance_id),
+                lease_epoch=CompletionLeaseEpoch(row.epoch),
+                expires_at=row.expires_at,
+                last_heartbeat_at=row.renewed_at,
+            )
+
+    def set_completion_phase(
+        self,
+        claim: CompletionClaim,
+        phase: CompletionPhase,
+        *,
+        final_present_observed: bool = False,
+        retryable_reconciliation: bool = False,
+        transient_read_failure: bool = False,
+    ) -> None:
+        """Advance durable completion work only under the current runner fence."""
+        with self._sessions.begin() as session:
+            upload = session.get(UploadSessionModel, claim.session_id.value, with_for_update=True)
+            if upload is None or upload.state != MultipartSessionState.COMPLETING.value:
+                raise AdmissionLeaseLostError("Stale completion owner cannot mutate work.")
+            if upload.completion_phase is None:
+                raise ContentConflictError("Completion work has no durable phase.")
+            current_phase = CompletionPhase(upload.completion_phase)
+            require_completion_phase_transition(
+                current_phase,
+                phase,
+                final_present_observed=final_present_observed,
+                retryable_reconciliation=retryable_reconciliation,
+                transient_read_failure=transient_read_failure,
+            )
+            changed = session.execute(
+                text(
+                    "UPDATE upload_sessions SET completion_phase = :phase, "
+                    "last_activity_at = clock_timestamp() WHERE id = :session_id "
+                    "AND state = 'COMPLETING' AND completion_phase = :current_phase "
+                    "AND EXISTS (SELECT 1 "
+                    "FROM multipart_completion_leases lease "
+                    "WHERE lease.upload_session_id = upload_sessions.id "
+                    "AND lease.owner_instance_id = :owner_id AND lease.epoch = :epoch "
+                    "AND lease.expires_at > clock_timestamp()) RETURNING id"
+                ),
+                {
+                    "phase": phase.value,
+                    "current_phase": current_phase.value,
+                    "session_id": claim.session_id.value,
+                    "owner_id": claim.lease.lease_owner_id.value,
+                    "epoch": claim.lease.lease_epoch.value,
+                },
+            ).scalar_one_or_none()
+            if changed is None:
+                raise AdmissionLeaseLostError("Stale completion owner cannot mutate work.")
+
+    def recover_partial_completion(
+        self, claim: CompletionClaim, evidence: PartialCompletionEvidence
+    ) -> CompletionRecoveryResult:
+        """Reconcile completion facts without reusing an invalidated provider attempt."""
+        observations = {part.part_number: part for part in evidence.provider_parts}
+        if len(observations) != len(evidence.provider_parts):
+            raise ContentConflictError("Provider Part observations contain duplicate numbers.")
+        with self._sessions.begin() as session:
+            upload = session.get(UploadSessionModel, claim.session_id.value, with_for_update=True)
+            lease = session.get(
+                MultipartCompletionLeaseModel,
+                claim.session_id.value,
+                with_for_update=True,
+            )
+            now = session.scalar(select(func.clock_timestamp()))
+            if not isinstance(now, datetime):
+                raise ContentConflictError("Database time is unavailable.")
+            if (
+                upload is None
+                or upload.state != MultipartSessionState.COMPLETING.value
+                or upload.provider_upload_id is None
+                or lease is None
+                or lease.owner_instance_id != claim.lease.lease_owner_id.value
+                or lease.epoch != claim.lease.lease_epoch.value
+                or lease.expires_at <= now
+            ):
+                raise AdmissionLeaseLostError(
+                    "Stale completion owner cannot recover the provider attempt."
+                )
+            parts = session.scalars(
+                select(UploadPartModel)
+                .where(UploadPartModel.upload_session_id == upload.id)
+                .order_by(UploadPartModel.part_number)
+                .with_for_update()
+            ).all()
+            if set(observations) - {part.part_number for part in parts}:
+                raise InvalidPartNumberError("Provider returned an unplanned Part.")
+
+            if evidence.recovery_reason in {
+                CompletionRecoveryReason.CONDITIONAL_409,
+                CompletionRecoveryReason.MULTIPART_SESSION_NOT_FOUND,
+            }:
+                upload.final_absence_observed_at = evidence.final_absence_observed_at
+                upload.last_provider_reconciled_at = evidence.provider_reconciled_at
+                upload.last_completion_result = evidence.persisted_completion_result
+                upload.provider_attempt_invalidated_at = now
+                upload.failure_code = "PROVIDER_ATTEMPT_INVALIDATED"
+                upload.state = MultipartSessionState.FAILED.value
+                upload.completed_at = now
+                upload.last_activity_at = now
+                lease.renewed_at = now
+                lease.expires_at = now
+                session.flush()
+                return CompletionRecoveryResult(
+                    action=CompletionRecoveryAction.START_NEW_GENERATION,
+                    context=self._load_multipart_context(session, upload),
+                )
+
+            upload.final_absence_observed_at = evidence.final_absence_observed_at
+            upload.last_provider_reconciled_at = evidence.provider_reconciled_at
+            upload.last_completion_result = evidence.persisted_completion_result
+            session.flush()
+            candidates: list[UploadPartModel] = []
+            for part in parts:
+                observation = observations.get(part.part_number)
+                if _apply_provider_part_observation(
+                    part, observation, evidence.provider_reconciled_at
+                ):
+                    if part.state == UploadPartState.PENDING.value:
+                        part.state = UploadPartState.UPLOADED.value
+                    candidates.append(part)
+                else:
+                    part.state = UploadPartState.PENDING.value
+            session.flush()
+            for part in candidates:
+                part.state = UploadPartState.VERIFIED.value
+                part.verified_at = evidence.provider_reconciled_at
+            session.flush()
+
+            all_parts_verified = all(part.state == UploadPartState.VERIFIED.value for part in parts)
+            if evidence.recovery_reason is CompletionRecoveryReason.PARTS_READY:
+                if not all_parts_verified:
+                    raise ContentConflictError(
+                        "PARTS_READY recovery requires every planned Part to match."
+                    )
+                return CompletionRecoveryResult(
+                    action=CompletionRecoveryAction.RETRY_COMPLETION,
+                    context=self._load_multipart_context(session, upload),
+                )
+            if evidence.recovery_reason is not CompletionRecoveryReason.PARTS_PARTIAL:
+                raise ContentConflictError("Unsupported completion recovery reason.")
+            if all_parts_verified:
+                raise ContentConflictError(
+                    "PARTS_PARTIAL recovery requires at least one unresolved Part."
+                )
+
+            upload.state = MultipartSessionState.IN_PROGRESS.value
+            upload.completion_reason = None
+            upload.completion_phase = None
+            upload.last_activity_at = now
+            lease.renewed_at = now
+            lease.expires_at = now
+            session.flush()
+            return CompletionRecoveryResult(
+                action=CompletionRecoveryAction.RESUME_PART_UPLOAD,
+                context=self._load_multipart_context(session, upload),
+            )
+
+    def record_verified_completion(
+        self, claim: CompletionClaim, evidence: VerificationEvidence
+    ) -> MultipartUploadContext:
+        """Commit structural evidence and publication under one completion fence."""
+        with self._sessions.begin() as session:
+            upload = session.get(UploadSessionModel, claim.session_id.value, with_for_update=True)
+            lease = session.get(
+                MultipartCompletionLeaseModel,
+                claim.session_id.value,
+                with_for_update=True,
+            )
+            now = session.scalar(select(func.clock_timestamp()))
+            if not isinstance(now, datetime):
+                raise ContentConflictError("Database time is unavailable.")
+            if (
+                upload is None
+                or upload.state != MultipartSessionState.COMPLETING.value
+                or lease is None
+                or lease.owner_instance_id != claim.lease.lease_owner_id.value
+                or lease.epoch != claim.lease.lease_epoch.value
+                or lease.expires_at <= now
+            ):
+                raise AdmissionLeaseLostError(
+                    "Stale completion owner cannot publish verification evidence."
+                )
+            if upload.completion_phase != CompletionPhase.FINAL_VERIFICATION.value:
+                raise IllegalTransitionError(
+                    "Multipart publication requires completion phase FINAL_VERIFICATION."
+                )
+            blob = session.get(BlobModel, upload.blob_id, with_for_update=True)
+            if blob is None:
+                raise ContentConflictError("Multipart Blob is unavailable.")
+            evidence.validate_for(Sha256Digest.parse(blob.sha256), blob.size_bytes)
+            if blob.state != BlobState.UPLOADING.value:
+                raise IllegalTransitionError("Only an UPLOADING Blob can be published.")
+
+            upload.verification_method = evidence.verification_method.value
+            upload.observed_sha256 = evidence.observed_sha256.value
+            upload.observed_size_bytes = evidence.observed_size_bytes
+            upload.verification_read_bytes = evidence.verification_read_bytes
+            upload.verification_completed_at = evidence.verification_completed_at
+            upload.verifier_implementation = evidence.verifier_version
+            session.flush()
+
+            blob.state = BlobState.VERIFYING.value
+            session.flush()
+            blob.state = BlobState.AVAILABLE.value
+            blob.verified_at = evidence.verification_completed_at
+            session.flush()
+
+            upload.state = MultipartSessionState.COMPLETED.value
+            upload.completed_at = evidence.verification_completed_at
+            upload.last_activity_at = now
+            lease.renewed_at = now
+            lease.expires_at = now
+            session.flush()
+            return self._load_multipart_context(session, upload)
+
     def _load_upload_context(self, session: Session, upload: UploadSessionModel) -> UploadContext:
+        _require_single_put_session(upload)
         blob = session.get(BlobModel, upload.blob_id)
         version = session.get(DatasetVersionModel, upload.initiating_version_id)
         if blob is None or version is None:
@@ -637,6 +1546,75 @@ class SqlAlchemyStore:
         if dataset is None:
             raise ContentConflictError("UploadSession Dataset is unavailable.")
         return _upload_context(version, dataset.name, blob, upload)
+
+    def _replay_multipart_context(
+        self,
+        session: Session,
+        replay: IdempotencyRecordModel,
+        request_sha256: str,
+    ) -> MultipartUploadContext:
+        if replay.request_sha256 != request_sha256 or replay.resource_id is None:
+            raise IdempotencyConflictError(
+                "Multipart request ID was already used for a different request."
+            )
+        upload = session.get(UploadSessionModel, replay.resource_id)
+        if upload is None or upload.strategy != "MULTIPART":
+            raise IdempotencyConflictError("Multipart idempotency resource is unavailable.")
+        return self._load_multipart_context(session, upload)
+
+    def _load_multipart_context(
+        self, session: Session, upload: UploadSessionModel
+    ) -> MultipartUploadContext:
+        blob = session.get(BlobModel, upload.blob_id)
+        if blob is None or upload.session_generation is None:
+            raise ContentConflictError("Multipart registry context is incomplete.")
+        part_models = session.scalars(
+            select(UploadPartModel)
+            .where(UploadPartModel.upload_session_id == upload.id)
+            .order_by(UploadPartModel.part_number)
+        ).all()
+        definitions = tuple(
+            PartDefinition(
+                part_number=part.part_number,
+                offset_bytes=part.offset_bytes,
+                size_bytes=part.size_bytes,
+                expected_sha256=Sha256Digest.parse(part.sha256),
+            )
+            for part in part_models
+        )
+        if (
+            upload.part_plan_schema_version is None
+            or upload.part_size_bytes is None
+            or upload.part_plan_sha256 is None
+        ):
+            raise ContentConflictError("Multipart session has no frozen PartPlan.")
+        plan = PartPlan.build(
+            schema_version=upload.part_plan_schema_version,
+            blob_size_bytes=blob.size_bytes,
+            part_size_bytes=upload.part_size_bytes,
+            parts=definitions,
+        )
+        parts = tuple(_upload_part_record(model) for model in part_models)
+        session_record = MultipartUploadSessionRecord(
+            id=MultipartSessionId(upload.id),
+            blob_id=upload.blob_id,
+            initiating_version_id=upload.initiating_version_id,
+            generation=MultipartSessionGeneration(upload.session_generation),
+            state=MultipartSessionState(upload.state),
+            part_plan=plan,
+            provider_upload_id=upload.provider_upload_id,
+            completion_phase=(
+                CompletionPhase(upload.completion_phase)
+                if upload.completion_phase is not None
+                else None
+            ),
+            failure_code=upload.failure_code,
+        )
+        return MultipartUploadContext(
+            session=session_record,
+            blob=_blob_record(blob),
+            parts=parts,
+        )
 
     @staticmethod
     def _get_or_create_blob(session: Session, digest: Sha256Digest, size_bytes: int) -> BlobModel:
@@ -696,6 +1674,7 @@ def _blob_record(model: BlobModel) -> BlobRecord:
 
 
 def _upload_session_record(model: UploadSessionModel) -> UploadSessionRecord:
+    _require_single_put_session(model)
     return UploadSessionRecord(
         id=model.id,
         blob_id=model.blob_id,
@@ -716,3 +1695,165 @@ def _upload_context(
         blob=_blob_record(blob),
         session=_upload_session_record(upload) if upload is not None else None,
     )
+
+
+def _require_single_put_session(model: UploadSessionModel) -> None:
+    if model.strategy != "SINGLE_PUT":
+        raise IllegalTransitionError(
+            "M1 single-PUT operation cannot use a MULTIPART UploadSession."
+        )
+
+
+def _multipart_request_sha256(scope: str, *values: str) -> str:
+    payload = json.dumps(
+        {"scope": scope, "values": list(values)},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _lock_multipart_request(session: Session, scope: str, key: str) -> None:
+    """Serialize one semantic request identity until its transaction ends."""
+    identity = f"{scope}\0{key}".encode()
+    advisory_key = int.from_bytes(
+        hashlib.sha256(identity).digest()[:8],
+        "big",
+        signed=True,
+    )
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:advisory_key)"),
+        {"advisory_key": advisory_key},
+    )
+
+
+def _admission_lease_record(model: MultipartAdmissionLeaseModel) -> AdmissionLeaseRecord:
+    return AdmissionLeaseRecord(
+        session_id=MultipartSessionId(model.upload_session_id),
+        invocation_id=MultipartInvocationId(model.invocation_id),
+        lease_owner_id=AdmissionLeaseOwnerId(model.owner_id),
+        lease_epoch=AdmissionLeaseEpoch(model.epoch),
+        expires_at=model.expires_at,
+        last_renewed_at=model.renewed_at,
+    )
+
+
+def _replay_admission_lease(
+    replay: IdempotencyRecordModel, request_sha256: str
+) -> AdmissionLeaseRecord:
+    if replay.request_sha256 != request_sha256 or replay.response_json is None:
+        raise IdempotencyConflictError(
+            "Admission request ID was already used for a different request."
+        )
+    response = replay.response_json
+    try:
+        return AdmissionLeaseRecord(
+            session_id=MultipartSessionId(UUID(str(response["session_id"]))),
+            invocation_id=MultipartInvocationId(UUID(str(response["invocation_id"]))),
+            lease_owner_id=AdmissionLeaseOwnerId(UUID(str(response["owner_id"]))),
+            lease_epoch=AdmissionLeaseEpoch(int(str(response["epoch"]))),
+            expires_at=datetime.fromisoformat(str(response["expires_at"])),
+            last_renewed_at=datetime.fromisoformat(str(response["renewed_at"])),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise IdempotencyConflictError("Admission replay response is invalid.") from error
+
+
+def _completion_lease_record(model: MultipartCompletionLeaseModel) -> CompletionLeaseRecord:
+    return CompletionLeaseRecord(
+        session_id=MultipartSessionId(model.upload_session_id),
+        lease_owner_id=CompletionLeaseOwnerId(model.owner_instance_id),
+        lease_epoch=CompletionLeaseEpoch(model.epoch),
+        expires_at=model.expires_at,
+        last_heartbeat_at=model.renewed_at,
+    )
+
+
+def _replay_accepted_completion(
+    replay: IdempotencyRecordModel,
+    request_sha256: str,
+    request_id: UUID,
+) -> AcceptedCompletion:
+    if replay.request_sha256 != request_sha256 or replay.resource_id is None:
+        raise IdempotencyConflictError(
+            "Completion request ID was already used for a different request."
+        )
+    if replay.http_status != 202:
+        raise IdempotencyConflictError("Completion replay does not contain the accepted response.")
+    return AcceptedCompletion(
+        request_id=request_id,
+        session_id=MultipartSessionId(replay.resource_id),
+    )
+
+
+def _upload_part_record(model: UploadPartModel) -> UploadPartRecord:
+    receipt = None
+    if (
+        model.upload_response_etag is not None
+        and model.upload_response_checksum_sha256_base64 is not None
+    ):
+        receipt = CompletedPartReceipt.from_upload_response(
+            part_number=model.part_number,
+            response_etag=model.upload_response_etag,
+            response_checksum_sha256_base64=model.upload_response_checksum_sha256_base64,
+            expected_sha256=Sha256Digest.parse(model.sha256),
+        )
+    return UploadPartRecord(
+        session_id=MultipartSessionId(model.upload_session_id),
+        definition=PartDefinition(
+            part_number=model.part_number,
+            offset_bytes=model.offset_bytes,
+            size_bytes=model.size_bytes,
+            expected_sha256=Sha256Digest.parse(model.sha256),
+        ),
+        state=UploadPartState(model.state),
+        response_receipt=receipt,
+    )
+
+
+def _apply_provider_part_observation(
+    part: UploadPartModel,
+    observation: ProviderPartObservation | None,
+    observed_at: datetime,
+) -> bool:
+    """Persist only structurally safe provider evidence and diagnose mismatches."""
+    if observation is None:
+        part.listed_etag = None
+        part.listed_checksum_sha256_base64 = None
+        part.listed_size_bytes = None
+        part.provider_listed_at = None
+        part.verified_at = None
+        part.last_error_code = "PART_NOT_PRESENT"
+        return False
+
+    expected_checksum = Sha256Digest.parse(part.sha256).checksum_base64
+    size_matches = observation.size_bytes == part.size_bytes
+    checksum_matches = observation.checksum_sha256_base64 == expected_checksum
+    part.listed_etag = observation.etag
+    part.listed_checksum_sha256_base64 = (
+        observation.checksum_sha256_base64 if checksum_matches else None
+    )
+    part.listed_size_bytes = observation.size_bytes
+    part.provider_listed_at = observed_at
+
+    if not size_matches:
+        part.verified_at = None
+        part.last_error_code = PartSizeMismatchError.code
+        return False
+    if not checksum_matches:
+        part.verified_at = None
+        part.last_error_code = PartChecksumRejectedError.code
+        return False
+    if part.upload_response_etag is None or part.upload_response_checksum_sha256_base64 is None:
+        part.verified_at = None
+        part.last_error_code = "PART_RECEIPT_MISSING"
+        return False
+    if (
+        part.upload_response_etag != observation.etag
+        or part.upload_response_checksum_sha256_base64 != observation.checksum_sha256_base64
+    ):
+        part.verified_at = None
+        part.last_error_code = "PART_RECEIPT_MISMATCH"
+        return False
+    part.last_error_code = None
+    return True
