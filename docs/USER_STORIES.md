@@ -119,9 +119,9 @@ using only documented `.env.example` values and health checks.
 
 ### US-12 — Clean abandoned uploads (`P1`)
 
-As an operator, after M2 introduces multipart, I can identify expired sessions, abort provider uploads, and
-mark them `ABORTED` without affecting completed blobs. A storage-side stale-upload policy provides a
-second cleanup layer.
+As an operator, after M2 introduces multipart, abandoned invocations release admission capacity
+without expiring resumable sessions. I can explicitly abort a known incomplete provider upload
+without affecting completed Blobs, while storage-side stale-upload policy handles unknown residue.
 
 ### US-13 — Diagnose a transfer (`P1`)
 

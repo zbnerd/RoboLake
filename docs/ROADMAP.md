@@ -62,20 +62,45 @@ later milestones must not be pulled forward as speculative infrastructure.
 
 **Goal:** Resume inside multi-gigabyte files while retaining M1 identity and create-only semantics.
 
+**Design status:** Under review in PR #5 — 2026-07-13. Implementation has not begun. See the
+[M2 product brief](M2_PRODUCT_BRIEF.md), [multipart architecture](M2_MULTIPART_ARCHITECTURE.md), and
+[implementation plan](M2_IMPLEMENTATION_PLAN.md).
+
 **Scope**
 
-- Add real UploadPart persistence and API-controlled multipart create/list/complete/abort operations.
-- Select part size within provider limits and 10,000 parts; issue exact short-lived part URLs.
-- Reconcile `ListParts`, ambiguous completion, expiry, and provider `NoSuchUpload` outcomes.
-- Apply create-only preconditions when publishing the final content-addressed object.
+- Keep the M1 single-PUT path through 5,000,000,000 bytes; add UploadPart persistence only above it.
+- Freeze a deterministic 64 MiB-based plan within provider limits and 10,000 parts; issue an exact
+  rolling window of short-lived part URLs.
+- Separate immutable request replay, CLI invocation metrics, and Blob-scoped provider-attempt
+  generations; make provider initiation ambiguity explicit.
+- Retain a complete UploadPart response receipt (PartNumber, ETag, Base64 `ChecksumSHA256`), send both
+  response fields for every ordered part in Complete, and use paginated `ListParts` only to verify
+  current provider state; receipt loss retransmits that exact part safely.
+- Keep persistent sessions separate from expiring upload admission and completion-runner leases so
+  abandoned clients/workers cannot permanently consume their separate caps.
+- Replay committed completion responses before admission fencing; first acceptance atomically stores
+  PostgreSQL work, releases admission, and returns 202. A same-artifact runner completes directly at
+  the final key with `If-None-Match: *`; Blob stays `UPLOADING` until full-stream evidence enters the
+  short `VERIFYING` publication transaction.
+- Bound abandoned incomplete MPUs with same-workflow abort and provider stale-upload expiry; do not
+  add temporary objects, final-object deletion, automatic repair, or general Blob GC.
 
 **Acceptance criteria**
 
 - A synthetic file above the M1 single-PUT limit uploads and pulls byte-identically.
-- Killing the CLI after arbitrary parts sends only absent/mismatched parts on rerun.
+- Killing the CLI after receipt-backed VERIFIED parts sends only unresolved parts on rerun; a part
+  whose UploadPart response was lost is safely retransmitted to obtain a receipt.
+- Create/resolve replay never rebinds a request; terminal attempts allocate the next generation.
+- Completion survives CLI/API disconnect, heartbeats through long verification, and fences stale
+  runners after takeover without an external queue.
 - Concurrent completion cannot overwrite a completed Blob and converges on one object.
-- Part receipts remain opaque; final integrity follows the approved provider-checksum/fallback
-  contract rather than treating ETag as SHA-256.
+- Lost Complete responses and `NoSuchUpload` converge through the deterministic final key.
+- Ambiguous non-409 partial completion resumes only through the guarded same-MPU recovery edge;
+  409/`NoSuchUpload` with no final starts a new MPU and retransmits every part.
+- Part receipts remain opaque; final integrity uses whole-byte SHA-256 and never treats ETag or a
+  multipart composite checksum as Blob identity.
+- Normal PR CI uses small multipart fixtures; a scheduled/manual >5,000,000,000-byte profile proves
+  bounded memory, resume, final publication, pull, and byte equality.
 
 ## M3 — Upload lifecycle cleanup and operator diagnosis
 

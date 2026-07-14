@@ -47,10 +47,10 @@ blob stores its bytes. It does not interpret the bytes.
 - MinIO-backed local development through the S3 API
 - Create-only presigned single PUT and file-level resume in M1; multipart/within-file resume in M2
 - Blob reuse by `(sha256, size_bytes)`
-- Provider system SHA-256/size verification with full-GET fallback when no system checksum exists;
-  download always hashes materialized bytes
+- M1 provider system SHA-256/size verification with full-GET fallback; M2 mandatory full-stream
+  SHA-256 verification after multipart completion; download always hashes materialized bytes
 - Explicit version and upload-session state transitions
-- Cleanup of abandoned multipart uploads
+- Fenced admission-lease expiry plus explicit known-MPU abort and provider stale-upload cleanup
 
 ## Explicit non-goals
 
@@ -93,8 +93,9 @@ alone is not a reason to add technology.
 - The API can reach PostgreSQL and object storage over a reliable local network; the CLI can reach
   the API and the object-storage endpoint embedded in presigned URLs.
 - Object storage is trusted to provide its documented system-checksum semantics. The exact pinned
-  MinIO image is a compatibility gate; an object with no retrievable system SHA-256 uses a streamed
-  full-GET fallback.
+  MinIO image is a compatibility gate. M1 falls back to streamed GET when full-object system SHA-256
+  is absent; M2 always streams the completed multipart object because its provider checksum is
+  composite.
 - Manifest-validity limits are fixed protocol constants. Transfer TTLs/timeouts and provider limits
   are operational settings bounded by protocol/provider maxima.
 - Local filesystem behavior is supported on Linux/macOS. Windows runtime, SMB edge cases, and

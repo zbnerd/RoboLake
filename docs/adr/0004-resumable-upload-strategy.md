@@ -3,6 +3,18 @@
 - **Status:** Accepted
 - **Date:** 2026-07-10
 
+## M2 supersession note
+
+This ADR remains the historical M1 decision for API-controlled presigned direct transfer. Its
+prospective M2 threshold, 72-hour application-session expiry, and provider-checksum fallback details
+are superseded by proposed ADRs [0008](0008-multipart-session-model.md),
+[0009](0009-multipart-final-publication.md), and [0010](0010-multipart-reconciliation.md) if PR #5
+is merged. The M2 design uses the released 5,000,000,000-byte threshold, persistent resumable
+generation-numbered sessions plus separate upload/completion leases, retained UploadPart response
+ETags rather than ListParts-only completion receipts, asynchronous PostgreSQL-claimed completion,
+and mandatory full-stream verification. These proposed changes do not alter this ADR's released M1
+decision.
+
 ## Context
 
 The transfer path must handle multi-gigabyte MCAP, video, and sensor files, unreliable connections,
