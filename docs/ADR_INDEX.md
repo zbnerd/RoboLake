@@ -1,9 +1,8 @@
 # Architecture Decision Record Index
 
-Accepted ADRs 0001–0007 define the released RoboLake v0.1.0 baseline. ADRs 0008–0010 are proposed by
-the unmerged M2 design PR and become Accepted only when that PR is merged. Accepted decisions must
-be revised through a new ADR rather than silently changed in implementation or deployment
-configuration; correcting a Proposed ADR in its original review does not require another ADR.
+Accepted ADRs 0001–0007 define the released RoboLake v0.1.0 baseline. ADRs 0008–0010 were accepted
+when M2 design PR #5 was merged on 2026-07-14. Accepted decisions must be revised through a new ADR
+rather than silently changed in implementation or deployment configuration.
 
 | ADR | Decision | Status |
 | --- | --- | --- |
@@ -14,9 +13,9 @@ configuration; correcting a Proposed ADR in its original review does not require
 | [0005](adr/0005-modular-monolith.md) | Keep domain/application framework-free inside one Python deployable and shared CLI package. | Accepted |
 | [0006](adr/0006-m1-conditional-single-put-slice.md) | Use create-only conditional PUT, whole-Blob resume, reconciliation, and one-at-a-time pull capability. | Accepted |
 | [0007](adr/0007-failed-publication-and-manual-repair.md) | Detect, report, and stop on poisoned objects; do not guess, overwrite, delete, or auto-repair. | Accepted |
-| [0008](adr/0008-multipart-session-model.md) | Freeze part plans and complete response receipts; separate resumable sessions from fenced upload/completion ownership. | Proposed |
-| [0009](adr/0009-multipart-final-publication.md) | Replay acceptance before fencing, publish directly create-only, and require full-byte SHA-256 before the short availability transaction. | Proposed |
-| [0010](adr/0010-multipart-reconciliation.md) | Reconcile response receipts, provider facts, initiation/completion ambiguity, and lease takeover deterministically. | Proposed |
+| [0008](adr/0008-multipart-session-model.md) | Freeze part plans and complete response receipts; separate resumable sessions from fenced upload/completion ownership. | Accepted |
+| [0009](adr/0009-multipart-final-publication.md) | Replay acceptance before fencing, publish directly create-only, and require full-byte SHA-256 before the short availability transaction. | Accepted |
+| [0010](adr/0010-multipart-reconciliation.md) | Reconcile response receipts, provider facts, initiation/completion ambiguity, and lease takeover deterministically. | Accepted |
 
 ## Reading order
 

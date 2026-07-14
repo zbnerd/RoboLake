@@ -1,6 +1,6 @@
 # ADR 0008: Multipart Session Model
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-13
 
 ## Context
