@@ -197,9 +197,60 @@ AWS models `CompletedPart.ChecksumSHA256` as optional in the general API. RoboLa
 it mandatory in its checksum-enabled SHA-256 multipart profile; this is a RoboLake portability rule,
 not a claim that AWS universally requires it. AWS documents that UploadPart returns ETag and the
 requested checksum, that Complete accepts per-part checksum fields, and that ListParts is for
-verification rather than the Complete receipt source. AWS was not contacted in this design task.
-The pinned-MinIO classifications above cover only the live operations listed in the probe table; the
-complete-receipt profile requires an implementation contract test.
+verification rather than the Complete receipt source. AWS was not contacted in this design task. The
+M2-B adapter now enforces this receipt profile and the pinned-MinIO implementation contract tests
+described below prove that MinIO accepts it.
+
+## M2-B automated provider-contract evidence
+
+On 2026-07-14, the M2-B integration suite exercised the adapter against the Compose-pinned image:
+
+```text
+minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+```
+
+Reproduction command:
+
+```console
+docker compose up -d --wait
+uv run pytest -q --no-cov tests/integration/test_m2_provider_contract.py
+```
+
+The seven `PINNED_MINIO_LIVE` tests passed. They established:
+
+- `CreateMultipartUpload` created a checksum-enabled attempt at the deterministic final key.
+- A presigned `UploadPart` accepted the exact signed length and SHA-256. Wrong bytes, a changed or
+  omitted checksum, a wrong length, a changed part number, a changed upload ID, and an expired
+  capability were rejected. This image returned 400 for an omitted signed checksum and 403 for a
+  changed signed checksum; RoboLake depends only on rejection, not those provider-specific codes.
+- A successful Part response exposed both ETag and `ChecksumSHA256`. An exact re-upload recovered a
+  deliberately discarded response receipt; ListParts remained observation-only.
+- Two different part numbers containing identical 6 MiB payloads produced equal ETags and checksums,
+  and those response receipts successfully completed one object.
+- A scoped botocore `before-sign.s3.CompleteMultipartUpload` hook observed the actual outgoing
+  `If-None-Match: *` header. Every completed part contained PartNumber, ETag, and
+  `ChecksumSHA256`.
+- Concurrent conditional completion of two MPUs at one final key converged on exactly one 200 winner
+  and one 412 loser. The winner's bytes remained at the final key.
+- Abort succeeded, ListParts then mapped provider `NoSuchUpload` to
+  `MULTIPART_SESSION_NOT_FOUND`, and final-object HEAD exposed only provider-owned composite
+  metadata.
+- Per-test cleanup aborted every test-owned incomplete MPU and deleted every test-owned object under
+  a randomized prefix; each fixture asserted zero remaining uploads and zero remaining objects.
+
+The unit suite labels separate evidence classes explicitly:
+
+- `AWS_DOCUMENTED_SYNTHETIC`: documented response loss, 409, embedded-error-in-200, timeout,
+  connection reset, NoSuchUpload, and abort ambiguity are injected through the SDK seam. These were
+  not claimed as live AWS or live MinIO observations.
+- `PROVIDER_CONTRACT_DEFENSIVE`: missing/malformed IDs, receipts, pages, continuation markers,
+  completion responses, and HEAD responses are rejected without leaking provider details.
+
+The adapter never treats a raw HTTP 200 alone as completion proof, never retries a 409, and never
+invokes unconditional completion. Opaque upload IDs and presigned capabilities cross only through
+application-private redacted contracts; their values never appear in repr, logs, telemetry, public
+API models, or error text. Whole-object canonical SHA-256 verification remains M2-D scope and is not
+claimed by these tests.
 
 ## Completion response contract
 
@@ -232,18 +283,18 @@ Official references:
 
 ## Unproven items
 
-- Packet-level loss during the Complete response was represented by deliberately discarding a
-  successful response. Implementation tests must add a faulting reverse proxy or transport stub.
-- An embedded-error-in-200 response was not induced live; it requires an adapter/SDK fake in normal
-  CI as specified above.
-- MinIO 409 was not observed; the restart rule comes from the AWS API contract and must be fault-
-  injected in CI.
+- Packet-level loss during the Complete response was not induced against live MinIO. The M2-B unit
+  suite injects a post-provider-success response-loss outcome at the SDK seam; an end-to-end proxy
+  fault remains M2-D fault-injection scope.
+- An embedded-error-in-200 response was not induced live; the M2-B adapter suite injects the SDK
+  `ClientError` shape with HTTP status 200 and verifies ambiguous completion translation.
+- MinIO 409 was not observed; the M2-B adapter suite injects AWS's documented 409 contract and
+  verifies that the old MPU is not automatically retried.
 - Seven-day stale-upload expiry was configured but not observed by waiting or changing server time.
 - AWS was not contacted by these probes; AWS portability statements come from official API/user
-  documentation. In particular, response-receipt retention versus ListParts-only completion needs a
-  future live AWS contract run before claiming AWS as tested. The RoboLake Complete profile's
-  per-part ETag-plus-`ChecksumSHA256` input also remains an implementation-time pinned-MinIO contract
-  test rather than a newly claimed probe result.
+  documentation. Response-receipt retention versus ListParts-only completion still needs a future
+  live AWS contract run before claiming AWS as tested. Per-part ETag-plus-`ChecksumSHA256` completion
+  is now pinned-MinIO tested, but remains live-AWS unverified.
 - Multi-gigabyte throughput and memory were not measured in this design task.
 - The 5 TiB pinned-MinIO maximum was source-inspected, not exercised by uploading a multi-TiB
   object. RoboLake deliberately uses AWS's lower 5 TB maximum as its cross-provider protocol bound.

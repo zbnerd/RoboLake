@@ -225,3 +225,27 @@ class FinalBlobPublicationConflictError(RoboLakeError):
     """Raised when conditional final publication requires reconciliation."""
 
     code = "FINAL_BLOB_PUBLICATION_CONFLICT"
+
+
+class ProviderContractError(RoboLakeError):
+    """Raised when object storage violates the required provider profile."""
+
+    code = "PROVIDER_CONTRACT_ERROR"
+
+
+class ProviderOperationRejectedError(RoboLakeError):
+    """Raised when object storage definitively rejects a control operation."""
+
+    code = "PROVIDER_OPERATION_REJECTED"
+
+
+class TransientProviderFailureError(RoboLakeError):
+    """Raised when a provider operation can be retried without changing identity."""
+
+    code = "TRANSIENT_PROVIDER_FAILURE"
+
+
+class MultipartAbortAmbiguousError(RoboLakeError):
+    """Raised when an abort may have settled but no response proves the outcome."""
+
+    code = "MULTIPART_ABORT_AMBIGUOUS"

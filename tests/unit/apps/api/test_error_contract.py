@@ -11,7 +11,11 @@ from apps.api.dependencies import ApiServices
 from apps.api.main import create_app
 from httpx import ASGITransport, AsyncClient
 from robolake.application.health import HealthService
-from robolake.domain.errors import StoredObjectMismatchError, UploadConflictError
+from robolake.domain.errors import (
+    ProviderContractError,
+    StoredObjectMismatchError,
+    UploadConflictError,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.anyio]
 
@@ -44,10 +48,17 @@ def _app(*, transfers: object, registry: object | None = None) -> Any:
             "CONTACT_OPERATOR",
         ),
         (UploadConflictError("provider response secret"), "UPLOAD_CONFLICT", "RETRY_PUSH"),
+        (
+            ProviderContractError(
+                "secret=http://storage.invalid/key?uploadId=private&X-Amz-Signature=private"
+            ),
+            "PROVIDER_CONTRACT_ERROR",
+            None,
+        ),
     ],
 )
 async def test_domain_conflicts_use_safe_symbolic_envelope(
-    error: Exception, code: str, next_action: str
+    error: Exception, code: str, next_action: str | None
 ) -> None:
     app = _app(transfers=RaisingTransfers(error))
 
