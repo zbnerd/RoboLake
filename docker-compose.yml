@@ -1,0 +1,101 @@
+name: robolake
+
+x-env-files: &env-files
+  - path: ./.env.example
+    required: true
+  - path: ./.env
+    required: false
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:979c4379dd698aba0b890599a6104e082035f98ef31d9b9291ec22f2b13059ca
+    env_file: *env-files
+    ports:
+      - "${ROBOLAKE_POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: server /data --console-address ":9001"
+    env_file: *env-files
+    environment:
+      MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL: 6h
+      MINIO_API_STALE_UPLOADS_EXPIRY: 168h
+    ports:
+      - "${ROBOLAKE_MINIO_PORT:-19000}:9000"
+      - "${ROBOLAKE_MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file: *env-files
+    volumes:
+      - ./config/minio/robolake-policy.template.json:/config/robolake-policy.template.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing "local/$$ROBOLAKE_S3_BUCKET"
+        while IFS= read -r line || [ -n "$$line" ]; do
+          printf '%s\n' "$${line//__ROBOLAKE_BUCKET__/$$ROBOLAKE_S3_BUCKET}"
+        done < /config/robolake-policy.template.json > /tmp/robolake-policy.json
+        mc admin user add local "$$ROBOLAKE_S3_ACCESS_KEY" "$$ROBOLAKE_S3_SECRET_KEY" \
+          || mc admin user info local "$$ROBOLAKE_S3_ACCESS_KEY"
+        mc admin policy create local robolake-api /tmp/robolake-policy.json
+        mc admin policy attach local robolake-api --user "$$ROBOLAKE_S3_ACCESS_KEY"
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    env_file: *env-files
+    environment:
+      ROBOLAKE_S3_ENDPOINT_URL: http://minio:9000
+    command:
+      - /bin/sh
+      - -c
+      - |
+        export ROBOLAKE_DATABASE_URL="postgresql+psycopg://$$POSTGRES_USER:$$POSTGRES_PASSWORD@postgres:5432/$$POSTGRES_DB"
+        alembic upgrade head
+        exec uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "${ROBOLAKE_API_PORT:-18000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  postgres-data:

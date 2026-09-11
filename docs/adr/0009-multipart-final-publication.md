@@ -1,0 +1,136 @@
+# ADR 0009: Multipart Final Publication
+
+- **Status:** Accepted
+- **Date:** 2026-07-13
+
+## Context
+
+Multipart completion normally replaces an existing object at the same key. Concurrent uploads can
+therefore violate immutable content addressing. Multipart SHA-256 is composite on the pinned MinIO
+provider and is not the canonical SHA-256 of the complete file. A temporary-object design avoids
+placing client bytes at the final key before verification, but requires safe large-object copy.
+
+Provider probes showed:
+
+- unconditional competing completion overwrote final bytes;
+- `CompleteMultipartUpload(If-None-Match: *)` preserved an existing object and converged 200/412;
+- destination `If-None-Match` on small `CopyObject` was ignored by pinned MinIO and overwrote bytes;
+- multipart copy could use conditional final completion, but exposed no SHA-256 and doubled
+  lifecycle/I/O; and
+- repeated/lost completion outcomes were recoverable only through the deterministic final key.
+
+## Decision
+
+Upload multipart directly to the deterministic final Blob key. The complete endpoint never holds a
+control request open for provider completion or final verification. It first replays an immutable
+matching completion idempotency record, before admission fencing; mismatch returns
+`IDEMPOTENCY_CONFLICT`. Only first execution validates the current upload fence and accepts either
+`PARTS_READY` (every response receipt is provider-verified) or `FINAL_PRESENT` (a fresh
+deterministic-key observation needs adoption verification). One transaction records
+`COMPLETING`/`PENDING`, creates pending work, releases that lease, and persists the exact safe HTTP
+202 response. A concurrent unique-key loser replays the winner. `FINAL_PRESENT` never marks
+incomplete parts VERIFIED or calls Complete with an incomplete receipt set.
+
+A bounded server runner from the same modular-monolith artifact claims work through PostgreSQL
+`FOR UPDATE SKIP LOCKED` or equivalent, under a separate completion owner UUID, monotonic epoch, and
+expiring lease. Default concurrency is 2 (hard maximum 8), with 120-second TTL and 30-second
+heartbeat. It submits `CompleteMultipartUpload(If-None-Match: *)` using ordered
+`CompletedPartReceipt` values containing PartNumber plus the ETag and Base64 `ChecksumSHA256`
+captured from successful UploadPart responses, then performs deterministic-key reconciliation and full verification. Its
+heartbeat runs in independent short transactions throughout the long provider calls. No Kafka,
+Celery, external queue, or long database transaction is introduced. A 200, 412, 409, timeout, or
+lost response is not sufficient to mark success.
+
+ETags are opaque fields within ordered completion receipts, not identifiers or integrity proof.
+Different part numbers may have identical ETags, provider checksums, and expected SHA-256 values when
+their bytes are identical; completion requires one stored UploadPart response receipt per expected
+part number but never receipt uniqueness. ListParts verifies that the current provider part matches
+the stored response ETag/checksum receipt, size, and checksum; it is not the source of the Complete
+receipt list.
+Supported providers must return the requested SHA-256 in the UploadPart response. Expected digest
+hex and provider Base64 must normalize to the same 32 raw bytes. AWS's general `CompletedPart`
+checksum field is optional; RoboLake makes it mandatory in this checksum-enabled SHA-256 profile. If
+the response was lost, RoboLake re-uploads that exact part and records both replacement response
+fields before completion.
+
+HTTP status 200 alone is never completion proof: CompleteMultipartUpload can embed an error after
+sending initial 200 headers. The SDK/provider adapter must parse and surface the final body outcome;
+an embedded error leaves the session non-terminal and triggers deterministic reconciliation.
+
+For every newly visible final multipart object whose Blob is not already `AVAILABLE`, keep the Blob
+`UPLOADING` while `completion_phase` advances through `FINAL_PRESENT` and `FINAL_VERIFICATION`.
+Stream the entire object and compare its SHA-256/size with immutable Blob identity. Only after the
+complete digest exists may one short fenced transaction record evidence, transition Blob
+`UPLOADING -> VERIFYING -> AVAILABLE`, and mark the session `COMPLETED`. A matching concurrent object
+is adopted. A proven mismatch performs `UPLOADING -> VERIFYING -> FAILED` with terminal session
+failure and `STORED_OBJECT_MISMATCH`/operator intervention. Transient provider/read failure leaves
+the Blob `UPLOADING`; no final object is overwritten or automatically deleted.
+
+The application records immutable `FULL_STREAM_SHA256` evidence: observed digest, observed size,
+verification-read bytes, completion time, and verifier implementation. PostgreSQL can enforce that
+these values structurally equal Blob identity; it cannot independently prove the external GET or
+hash computation occurred. Provider integration tests supply that proof.
+
+Every completion-state write includes the current completion owner and epoch. Lease renewal failure
+or takeover fences the stale runner from committing `COMPLETED`, `FAILED`, verification evidence, or
+Blob `AVAILABLE`. Provider Complete may already have settled, so the next owner checks the final key
+first and safely repeats a full verification read when required. CLI status polling is independent
+of that work; Ctrl-C stops local waiting but never aborts server-owned completion.
+
+This supersedes only ADR 0004's prospective M2 claim that a provider system full-object SHA-256 is
+normally available for multipart. The pinned provider exposes only a composite SHA-256, so M2
+full-byte verification is mandatory rather than a missing-checksum fallback. ADR 0004's historical
+and accepted M1 direct-transfer decision remains unchanged.
+
+## Concrete failure prevented
+
+Two clients complete different MPUs to one SHA key. Without a precondition, the later completion
+silently replaces bytes already referenced by READY data. With conditional completion, one wins and
+the other receives 412. Whole-byte verification then prevents a composite checksum or erroneous
+client part plan from becoming an AVAILABLE attestation.
+
+## Consequences
+
+- Final publication costs one additional full provider read for every new multipart Blob.
+- Worker failure during that read may cause a full reread; Range verification resume is not M2.
+- Completion is eventually processed by a PostgreSQL-claimed runner and does not inherit the CLI
+  control-request timeout or upload admission-lease lifetime.
+- Metrics expose completed-object bytes, verification-read bytes, and whole-object verification
+  duration separately from new/reused part payload bytes; none claim exact wire traffic.
+- A buggy/malicious trusted caller can still cause wrong bytes to occupy a non-AVAILABLE final key
+  before detection; ADR 0007's detect/report/stop boundary applies.
+- There is no temporary namespace, temporary-object deletion, or second copy state.
+- A known losing incomplete MPU is best-effort aborted before terminal adoption; failed/unknown
+  cleanup relies on stale-provider lifecycle and never blocks a matching AVAILABLE attestation.
+- M1 create-only keys, AVAILABLE meaning, READY meaning, and no-overwrite/no-delete rules remain
+  unchanged.
+
+## Alternatives considered
+
+### Temporary key plus single CopyObject
+
+Rejected because objects above 5 GB require multipart copy on AWS and the pinned MinIO ignored the
+destination create-only condition for CopyObject.
+
+### Temporary key plus multipart copy
+
+Rejected for M2 because it adds a second resumable MPU, transient duplicate storage, copy I/O, two
+verification reads on MinIO, and temporary deletion. Copy parts exposed no SHA-256, so it did not
+remove final verification. Revisit only with a changed trust model/provider contract.
+
+### Trust multipart ETag or composite SHA-256
+
+Rejected because neither equals the canonical whole-file SHA-256.
+
+### Proxy verified bytes through the API
+
+Rejected because the API would become a second multi-gigabyte data path and M2 would no longer be a
+direct-transfer extension.
+
+## Related documents
+
+- [Provider probes](../M2_PROVIDER_PROBES.md)
+- [Failure matrix](../M2_FAILURE_AND_RECONCILIATION_MATRIX.md)
+- [Poisoned final-key operator runbook](../M2_POISONED_FINAL_KEY_RUNBOOK.md)
+- [ADR 0003](0003-object-storage-and-content-addressed-blobs.md)
+- [ADR 0007](0007-failed-publication-and-manual-repair.md)
